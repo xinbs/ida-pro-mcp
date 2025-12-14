@@ -20,7 +20,7 @@ SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 IDA_DIR = os.environ.get("IDADIR", r"C:\Program Files\IDA Professional 9.2")
 
 # Files to ignore in the file list (IDA temporary/intermediate files)
-IGNORED_EXTENSIONS = {".id0", ".id1", ".id2", ".nam", ".til", ".dmp"}
+IGNORED_EXTENSIONS = {".id0", ".id1", ".id2", ".nam", ".til", ".dmp", ".i64"}
 
 # Global State
 class ProcessState:
