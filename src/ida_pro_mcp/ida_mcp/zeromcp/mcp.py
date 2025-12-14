@@ -1,5 +1,6 @@
 import re
 import sys
+import logging
 import time
 import uuid
 import json
@@ -70,7 +71,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         """Override to suppress default logging or customize"""
-        pass
+        # logging.getLogger().info(f"[MCP] {self.client_address[0]} - {format % args}")
+        print(f"[MCP] {self.client_address[0]} - {format % args}", flush=True)
 
     def send_cors_headers(self, *, preflight = False):
         origin = self.headers.get("Origin", "")
@@ -104,6 +106,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def handle(self):
         """Override to add error handling for connection errors"""
         try:
+            print(f"[MCP] New connection from {self.client_address}", flush=True)
             super().handle()
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
             # Client disconnected - normal, suppress traceback
@@ -270,7 +273,9 @@ class McpServer:
 
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
-        self._http_server = (ThreadingHTTPServer if background else HTTPServer)(
+        # ALWAYS use ThreadingHTTPServer because SSE requires concurrent connections.
+        # Even if running in foreground (background=False), we need threads for handlers.
+        self._http_server = ThreadingHTTPServer(
             (host, port), request_handler, bind_and_activate=False
         )
         self._http_server.allow_reuse_address = False

@@ -349,8 +349,9 @@ def strings(
     queries = normalize_dict_list(
         queries, lambda s: {"offset": 0, "count": 50, "filter": s}
     )
-    # Use cached strings instead of rebuilding every time
-    all_strings = _get_cached_strings()
+    
+    # We remove the cached strings call here to avoid OOM on large binaries
+    # all_strings = _get_cached_strings() 
 
     results = []
     for query in queries:
@@ -362,8 +363,95 @@ def strings(
         if filter_pattern in ("", "*"):
             filter_pattern = ""
 
-        filtered = pattern_filter(all_strings, filter_pattern, "string")
-        results.append(paginate(filtered, offset, count))
+        # Optimization: Use api_analysis._perform_binary_search if pattern is provided
+        if filter_pattern and len(filter_pattern) > 3:
+            try:
+                from .api_analysis import _perform_binary_search
+                # Use binary search to find matches
+                search_results = _perform_binary_search([filter_pattern], count, offset, 60)
+                
+                # Convert to String objects
+                matched_strings = []
+                for res in search_results:
+                    for m_addr_str in res.get("matches", []):
+                        try:
+                            ea = int(m_addr_str, 16)
+                            # Try to get string content
+                            s_content = filter_pattern
+                            s_len = len(filter_pattern)
+                            
+                            # Best effort to get real string content
+                            detected_str_type = ida_nalt.get_str_type(ea)
+                            if detected_str_type:
+                                content = idc.get_strlit_contents(ea, -1, detected_str_type)
+                                if content:
+                                    s_content = content.decode("utf-8", errors="replace")
+                                    s_len = len(content)
+                                    
+                            matched_strings.append(
+                                String(addr=hex(ea), length=s_len, string=s_content)
+                            )
+                        except:
+                            pass
+                            
+                results.append(
+                    Page(
+                        items=matched_strings,
+                        total=len(matched_strings), # Estimated
+                        limit=count,
+                        offset=offset
+                    )
+                )
+                continue
+            except ImportError:
+                pass # Fallback to slow method if import fails
+            except Exception as e:
+                print(f"[MCP] Optimized strings list failed: {e}")
+
+        # Fallback: Iterate using generator (slow but reliable for wildcards)
+        filtered_strings = []
+        
+        # Use generator to avoid building full list
+        try:
+            matched_count = 0
+            skipped_count = 0
+            
+            for s in idautils.Strings():
+                # Apply filter
+                s_str = str(s)
+                if filter_pattern and filter_pattern.lower() not in s_str.lower():
+                    continue
+                    
+                # Pagination logic: skip until offset
+                if skipped_count < offset:
+                    skipped_count += 1
+                    continue
+                    
+                # Add to result
+                filtered_strings.append(
+                    String(addr=hex(s.ea), length=s.length, string=s_str)
+                )
+                matched_count += 1
+                
+                # Stop if we have enough
+                if matched_count >= count:
+                    break
+                    
+                # Safety break for huge lists without filter
+                if not filter_pattern and (matched_count + skipped_count) > 100000:
+                    break
+                    
+        except Exception:
+            pass
+
+        results.append(
+            Page(
+                items=filtered_strings,
+                total=offset + len(filtered_strings) + (1 if len(filtered_strings) == count else 0), # Rough estimate
+                limit=count,
+                offset=offset
+            )
+        )
 
     return results
 

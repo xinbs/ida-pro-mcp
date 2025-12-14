@@ -38,6 +38,12 @@ class IDASafety(IntEnum):
 
 call_stack = queue.LifoQueue()
 
+# --- Headless Mode Support ---
+HEADLESS_MODE = False
+HEADLESS_QUEUE = queue.Queue()
+# -----------------------------
+
+import threading
 
 def _sync_wrapper(ff, safety_mode: IDASafety):
     """Call a function ff with a specific IDA safety_mode."""
@@ -53,6 +59,10 @@ def _sync_wrapper(ff, safety_mode: IDASafety):
         if not call_stack.empty():
             last_func_name = call_stack.get()
             error_str = f"Call stack is not empty while calling the function {ff.__name__} from {last_func_name}"
+            # In Headless mode, if we are on the main thread, we might be recursively calling.
+            # But the original logic forbids this. We should respect it, OR modify it.
+            # For now, let's keep the error, but if we are on main thread in headless mode,
+            # we should avoid the DEADLOCK first. The Error is better than Deadlock.
             raise IDASyncError(error_str)
 
         call_stack.put((ff.__name__))
@@ -63,8 +73,21 @@ def _sync_wrapper(ff, safety_mode: IDASafety):
         finally:
             call_stack.get()
 
-    idaapi.execute_sync(runned, safety_mode)
-    res = res_container.get()
+    if HEADLESS_MODE:
+        # Check if we are already on the main thread
+        if threading.current_thread() is threading.main_thread():
+            # If we are on the main thread, we MUST execute directly to avoid deadlock.
+            # Calling HEADLESS_QUEUE.put() and waiting for ourselves would block forever.
+            runned()
+            res = res_container.get()
+        else:
+            # We are on a worker thread (HTTP request handler), so we queue it.
+            HEADLESS_QUEUE.put(runned)
+            res = res_container.get()
+    else:
+        idaapi.execute_sync(runned, safety_mode)
+        res = res_container.get()
+
     if isinstance(res, Exception):
         raise res
     return res

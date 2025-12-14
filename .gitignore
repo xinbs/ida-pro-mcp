@@ -22,6 +22,6 @@ venv*/
 *.id2
 *.til
 *.elf
-
+web_manager/uploaded_files/*
 # Generated server files
 server_generated.py

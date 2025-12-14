@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDA MCP Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-gray-100 min-h-screen p-8" x-data="app()">
+
+    <div class="max-w-4xl mx-auto">
+        <!-- Header -->
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-bold text-gray-800">IDA MCP Manager</h1>
+                <p class="text-gray-500 mt-1">Manage your Headless IDA MCP instances</p>
+            </div>
+            <div class="flex items-center space-x-2">
+                <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium"
+                      :class="status.running ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'">
+                    <span class="w-2 h-2 mr-2 rounded-full" :class="status.running ? 'bg-green-500' : 'bg-gray-400'"></span>
+                    <span x-text="status.running ? 'Service Running' : 'Service Stopped'"></span>
+                </span>
+            </div>
+        </div>
+
+        <!-- Active Service Card -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8 border-l-4" 
+             :class="status.running ? 'border-green-500' : 'border-gray-300'">
+            <div class="flex justify-between items-start">
+                <div>
+                    <h2 class="text-xl font-semibold text-gray-800 mb-2">Current Status</h2>
+                    <template x-if="status.running">
+                        <div class="space-y-2">
+                            <p class="text-gray-600">Analyzing: <span class="font-mono font-bold text-gray-900" x-text="status.filename"></span></p>
+                            <p class="text-gray-600">PID: <span class="font-mono text-gray-900" x-text="status.pid"></span></p>
+                            <p class="text-gray-600">Uptime: <span class="font-mono text-gray-900" x-text="formatUptime(status.uptime_seconds)"></span></p>
+                            <div class="mt-4 p-3 bg-blue-50 rounded border border-blue-100">
+                                <p class="text-sm text-blue-800 font-semibold mb-1">MCP Connection URL:</p>
+                                <div class="flex items-center">
+                                    <code class="flex-1 font-mono text-sm text-blue-900 bg-white px-2 py-1 rounded border border-blue-200" x-text="status.mcp_url"></code>
+                                    <button @click="copyUrl()" class="ml-2 text-blue-600 hover:text-blue-800 text-sm">Copy</button>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="!status.running">
+                        <p class="text-gray-500 italic">No IDA instance is currently running.</p>
+                    </template>
+                </div>
+                <div>
+                    <template x-if="status.running">
+                        <button @click="stopService()" 
+                                class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded shadow transition flex items-center">
+                            <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                            Stop Service
+                        </button>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- Console Output -->
+        <div class="bg-gray-900 rounded-lg shadow-md p-6 mb-8 text-white font-mono text-sm">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-lg font-semibold text-gray-200">Console Output</h2>
+                <div class="flex items-center space-x-2">
+                    <span class="inline-block w-2 h-2 rounded-full" 
+                          :class="connected ? 'bg-green-500' : 'bg-red-500'"></span>
+                    <span class="text-xs text-gray-400" x-text="connected ? 'Connected' : 'Disconnected'"></span>
+                    <button @click="clearLogs()" class="ml-4 text-xs text-gray-400 hover:text-white">Clear</button>
+                </div>
+            </div>
+            <div class="h-64 overflow-y-auto bg-black p-4 rounded border border-gray-700" id="console-logs">
+                <template x-for="(log, index) in logs" :key="index">
+                    <div class="whitespace-pre-wrap break-all" x-text="log"></div>
+                </template>
+                <template x-if="logs.length === 0">
+                    <div class="text-gray-600 italic">No logs available...</div>
+                </template>
+            </div>
+        </div>
+
+        <!-- File Manager -->
+        <div class="bg-white rounded-lg shadow-md overflow-hidden">
+            <div class="p-6 border-b border-gray-100 flex justify-between items-center">
+                <h2 class="text-xl font-semibold text-gray-800">Sample Repository</h2>
+                <!-- Upload Button -->
+                <div class="relative">
+                    <input type="file" @change="uploadFile($event)" class="hidden" id="file-upload">
+                    <label for="file-upload" class="cursor-pointer bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded shadow transition flex items-center">
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                        Upload Sample
+                    </label>
+                </div>
+            </div>
+            
+            <table class="w-full text-left">
+                <thead class="bg-gray-50 text-gray-600 text-sm uppercase">
+                    <tr>
+                        <th class="px-6 py-3">Filename</th>
+                        <th class="px-6 py-3">Size</th>
+                        <th class="px-6 py-3 text-right">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                    <template x-for="file in files" :key="file.filename">
+                        <tr class="hover:bg-gray-50 transition">
+                            <td class="px-6 py-4 font-medium text-gray-900" x-text="file.filename"></td>
+                            <td class="px-6 py-4 text-gray-500" x-text="formatBytes(file.size)"></td>
+                            <td class="px-6 py-4 text-right space-x-2">
+                                <button @click="startService(file.filename)" 
+                                        :disabled="status.running"
+                                        class="text-green-600 hover:text-green-900 disabled:opacity-50 disabled:cursor-not-allowed font-medium">
+                                    Start Analysis
+                                </button>
+                                <button @click="deleteFile(file.filename)" 
+                                        :disabled="status.running && status.filename === file.filename"
+                                        class="text-red-600 hover:text-red-900 disabled:opacity-50 disabled:cursor-not-allowed">
+                                    Delete
+                                </button>
+                            </td>
+                        </tr>
+                    </template>
+                    <template x-if="files.length === 0">
+                        <tr>
+                            <td colspan="3" class="px-6 py-8 text-center text-gray-500">
+                                No files uploaded yet. Upload a binary to get started.
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        function app() {
+            return {
+                files: [],
+                status: {
+                    running: false,
+                    filename: null,
+                    pid: null,
+                    uptime_seconds: 0,
+                    mcp_url: null
+                },
+                logs: [],
+                connected: false,
+                socket: null,
+                refreshInterval: null,
+
+                init() {
+                    this.loadFiles();
+                    this.loadStatus();
+                    this.connectWebSocket();
+                    // Auto-refresh status every 2 seconds
+                    this.refreshInterval = setInterval(() => this.loadStatus(), 2000);
+                },
+
+                connectWebSocket() {
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    this.socket = new WebSocket(`${protocol}//${window.location.host}/ws/logs`);
+                    
+                    this.socket.onopen = () => {
+                        this.connected = true;
+                    };
+                    
+                    this.socket.onmessage = (event) => {
+                        this.logs.push(event.data);
+                        if (this.logs.length > 1000) this.logs.shift();
+                        this.$nextTick(() => {
+                            const el = document.getElementById('console-logs');
+                            if (el) el.scrollTop = el.scrollHeight;
+                        });
+                    };
+                    
+                    this.socket.onclose = () => {
+                        this.connected = false;
+                        // Try to reconnect in 3 seconds
+                        setTimeout(() => this.connectWebSocket(), 3000);
+                    };
+                    
+                    this.socket.onerror = (error) => {
+                        console.error("WebSocket error:", error);
+                        this.socket.close();
+                    };
+                },
+
+                clearLogs() {
+                    this.logs = [];
+                },
+
+                async loadFiles() {
+                    const res = await fetch('/api/files');
+                    this.files = await res.json();
+                },
+
+                async loadStatus() {
+                    const res = await fetch('/api/status');
+                    this.status = await res.json();
+                },
+
+                async uploadFile(event) {
+                    const file = event.target.files[0];
+                    if (!file) return;
+
+                    const formData = new FormData();
+                    formData.append('file', file);
+
+                    try {
+                        const res = await fetch('/api/upload', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        if (res.ok) {
+                            this.loadFiles();
+                            event.target.value = ''; // Reset input
+                        } else {
+                            alert('Upload failed');
+                        }
+                    } catch (e) {
+                        alert('Error uploading file');
+                    }
+                },
+
+                async deleteFile(filename) {
+                    if (!confirm(`Are you sure you want to delete ${filename}?`)) return;
+                    
+                    const res = await fetch(`/api/files/${filename}`, { method: 'DELETE' });
+                    if (res.ok) this.loadFiles();
+                },
+
+                async startService(filename) {
+                    try {
+                        const res = await fetch('/api/start', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ filename })
+                        });
+                        if (!res.ok) {
+                            const err = await res.json();
+                            alert(err.detail);
+                        } else {
+                            this.loadStatus();
+                        }
+                    } catch (e) {
+                        alert('Failed to start service');
+                    }
+                },
+
+                async stopService() {
+                    if (!confirm('Are you sure you want to stop the current analysis?')) return;
+                    
+                    try {
+                        const res = await fetch('/api/stop', { method: 'POST' });
+                        if (res.ok) this.loadStatus();
+                    } catch (e) {
+                        alert('Failed to stop service');
+                    }
+                },
+
+                copyUrl() {
+                    if (this.status.mcp_url) {
+                        navigator.clipboard.writeText(this.status.mcp_url);
+                    }
+                },
+
+                formatBytes(bytes, decimals = 2) {
+                    if (bytes === 0) return '0 Bytes';
+                    const k = 1024;
+                    const dm = decimals < 0 ? 0 : decimals;
+                    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+                },
+
+                formatUptime(seconds) {
+                    if (!seconds) return '0s';
+                    const h = Math.floor(seconds / 3600);
+                    const m = Math.floor((seconds % 3600) / 60);
+                    const s = Math.floor(seconds % 60);
+                    return `${h}h ${m}m ${s}s`;
+                }
+            }
+        }
+    </script>
+</body>
+</html>

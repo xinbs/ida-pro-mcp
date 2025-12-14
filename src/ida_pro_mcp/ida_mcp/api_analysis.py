@@ -1,4 +1,5 @@
 from typing import Annotated, Optional
+import time
 import ida_hexrays
 import ida_kernwin
 import ida_lines
@@ -920,6 +921,464 @@ def find_paths(queries: list[PathQuery] | PathQuery) -> list[dict]:
 
 @tool
 @idaread
+def find_crypt_constants(
+    limit: Annotated[int, "Max matches per constant type (default: 100)"] = 100,
+) -> list[dict]:
+    """Identify common cryptographic constants (AES S-Boxes, MD5/SHA initializers, etc.)"""
+    
+    # Common crypto constants signatures
+    # Format: (Name, Pattern string)
+    CRYPTO_SIGNATURES = [
+        # AES
+        ("AES_Sbox", "63 7C 77 7B F2 6B 6F C5 30 01 67 2B FE D7 AB 76"),
+        ("AES_InvSbox", "52 09 6A D5 30 36 A5 38 BF 40 A3 9E 81 F3 D7 FB"),
+        ("AES_Te0", "C6 63 63 A5 F8 7C 7C 84 EE 77 77 99 F6 7B 7B 8D"),
+        ("AES_Td0", "51 F4 A7 50 7E 41 65 53 1A 17 A4 C3 3A 27 5E 96"),
+        
+        # MD5
+        ("MD5_Init", "01 23 45 67 89 AB CD EF FE DC BA 98 76 54 32 10"), # A, B, C, D (Little Endian)
+        ("MD5_K", "78 A4 6A D7 56 B7 C7 E8 DB 70 20 24 EE CE BD 45"), # First 4 constants
+        
+        # SHA-1
+        ("SHA1_Init", "01 23 45 67 89 AB CD EF FE DC BA 98 76 54 32 10 F0 E1 D2 C3"), # A, B, C, D, E (Big Endian logic but byte sequence depends)
+        # Actually SHA1 init is often separate dwords. Let's try byte sequence for common impls (e.g. OpenSSL)
+        # h0=0x67452301, h1=0xEFCDAB89, h2=0x98BADCFE, h3=0x10325476, h4=0xC3D2E1F0
+        # Little Endian: 01 23 45 67 89 AB CD EF ...
+        
+        # SHA-256
+        ("SHA256_K", "98 2F 8A 42 91 44 37 71 CF FB C0 B5 A5 DB B5 E9"), # First 4 constants
+        
+        # RC4 (Look for 00..FF sequence, though common in other things too)
+        # ("RC4_Sbox_Init", "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F"), # Too generic?
+        
+        # Zlib / Deflate
+        ("Zlib_Distance_Code", "00 00 00 00 01 00 00 00 02 00 00 00 03 00 00 00"), # Common table start
+    ]
+
+    results = []
+    
+    # Pre-fetch min/max addresses
+    min_ea = ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
+
+    for name, pattern in CRYPTO_SIGNATURES:
+        try:
+            # Reuse _perform_binary_search logic directly? 
+            # Or just use ida_search.find_binary since we have hex patterns
+            
+            curr_ea = min_ea
+            count = 0
+            matches = []
+            
+            while True:
+                # Use idc.find_binary / ida_search.find_binary
+                # Pattern is space-separated hex
+                found_ea = idaapi.BADADDR
+                
+                if hasattr(idc, "find_binary"):
+                    found_ea = idc.find_binary(curr_ea, idc.SEARCH_DOWN, pattern)
+                elif hasattr(idc, "FindBinary"):
+                    found_ea = idc.FindBinary(curr_ea, idc.SEARCH_DOWN, pattern)
+                elif hasattr(ida_bytes, "bin_search"):
+                     # Fallback
+                     pt_obj = ida_bytes.compiled_binpat_vec_t()
+                     ida_bytes.parse_binpat_str(pt_obj, curr_ea, pattern, 16)
+                     res = ida_bytes.bin_search(curr_ea, max_ea, pt_obj, ida_bytes.BIN_SEARCH_FORWARD)
+                     if isinstance(res, tuple):
+                         found_ea = res[0]
+                     else:
+                         found_ea = res
+                
+                if found_ea == idaapi.BADADDR or found_ea >= max_ea:
+                    break
+                    
+                matches.append(hex(found_ea))
+                count += 1
+                curr_ea = found_ea + 1
+                
+                if count >= limit:
+                    break
+            
+            if matches:
+                results.append({
+                    "algorithm": name,
+                    "matches": matches,
+                    "count": count
+                })
+                
+        except Exception as e:
+            print(f"[MCP] Error searching for {name}: {e}")
+            
+    return results
+
+
+@tool
+@idaread
+def get_function_complexity(
+    addrs: Annotated[list[str] | str, "Function addresses to analyze"],
+) -> list[dict]:
+    """Calculate function complexity metrics (Cyclomatic Complexity, size, etc.)"""
+    addrs = normalize_list_input(addrs)
+    results = []
+    
+    for addr in addrs:
+        try:
+            ea = parse_address(addr)
+            func = idaapi.get_func(ea)
+            if not func:
+                results.append({"addr": addr, "error": "Function not found"})
+                continue
+                
+            # Get flow chart
+            fc = idaapi.FlowChart(func)
+            
+            # Basic metrics
+            num_blocks = fc.size
+            num_instructions = 0
+            num_edges = 0
+            
+            for block in fc:
+                # Count instructions
+                head = block.start_ea
+                while head < block.end_ea:
+                    num_instructions += 1
+                    head = idc.next_head(head, block.end_ea)
+                
+                # Count edges (successors)
+                num_edges += sum(1 for _ in block.succs())
+            
+            # Cyclomatic Complexity: E - N + 2P (P=1 for single function)
+            # E = edges, N = nodes (blocks)
+            cyclomatic = num_edges - num_blocks + 2
+            
+            func_name = ida_funcs.get_func_name(func.start_ea)
+            
+            results.append({
+                "addr": hex(func.start_ea),
+                "name": func_name,
+                "metrics": {
+                    "basic_blocks": num_blocks,
+                    "instructions": num_instructions,
+                    "edges": num_edges,
+                    "cyclomatic_complexity": cyclomatic,
+                    "size_bytes": func.size(),
+                }
+            })
+            
+        except Exception as e:
+            results.append({"addr": addr, "error": str(e)})
+            
+    return results
+
+
+@tool
+@idaread
+def trace_argument(
+    addr: Annotated[str, "Address of the function call instruction"],
+    arg_index: Annotated[int, "Argument index (0-based)"],
+) -> dict:
+    """Trace the origin of a function argument (Experimental)"""
+    # This requires Hex-Rays decompiler to be effective
+    try:
+        ea = parse_address(addr)
+        
+        # Decompile the function containing the call
+        func = idaapi.get_func(ea)
+        if not func:
+            return {"error": "Address not in a function"}
+            
+        try:
+            cfunc = ida_hexrays.decompile(func)
+        except Exception:
+            return {"error": "Decompilation failed"}
+            
+        if not cfunc:
+            return {"error": "Decompilation failed"}
+            
+        # Find the call expression at 'ea'
+        # This is tricky because one instruction might map to multiple C items
+        # We need to traverse the C tree to find the call
+        
+        class CallFinder(ida_hexrays.ctree_visitor_t):
+            def __init__(self, target_ea):
+                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                self.target_ea = target_ea
+                self.found_call = None
+                
+            def visit_expr(self, e):
+                if e.op == ida_hexrays.cot_call and e.ea == self.target_ea:
+                    self.found_call = e
+                    return 1 # Stop
+                return 0
+                
+        finder = CallFinder(ea)
+        finder.apply_to(cfunc.body, None)
+        
+        if not finder.found_call:
+            return {"error": "Could not locate call expression at address"}
+            
+        # Get argument expression
+        args = finder.found_call.a
+        if arg_index >= len(args):
+            return {"error": f"Argument index {arg_index} out of bounds (count: {len(args)})"}
+            
+        arg_expr = args[arg_index]
+        
+        # Analyze the argument expression
+        result = {
+            "addr": hex(ea),
+            "arg_index": arg_index,
+            "expr_type": "unknown",
+            "value": None,
+            "sources": []
+        }
+        
+        if arg_expr.op == ida_hexrays.cot_num:
+            result["expr_type"] = "constant"
+            result["value"] = hex(arg_expr.n.value(arg_expr.type))
+            
+        elif arg_expr.op == ida_hexrays.cot_obj:
+            result["expr_type"] = "global"
+            result["value"] = hex(arg_expr.obj_ea)
+            result["name"] = ida_name.get_name(arg_expr.obj_ea)
+            
+        elif arg_expr.op == ida_hexrays.cot_str:
+            result["expr_type"] = "string"
+            result["value"] = arg_expr.string
+            
+        elif arg_expr.op == ida_hexrays.cot_var:
+            result["expr_type"] = "variable"
+            # Get variable info
+            lvar = cfunc.get_lvars()[arg_expr.v.idx]
+            result["name"] = lvar.name
+            
+            # Simple def-use trace (find where this var was last assigned)
+            # This is complex in Python API, but we can try basic check
+            # For now, just return the variable info
+            
+        else:
+            result["expr_type"] = "complex"
+            result["op_code"] = arg_expr.op
+            result["pretty_print"] = str(arg_expr) # Need a way to print ctree item
+            
+        return result
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+@idaread
+def emulate_snippet(
+    start_addr: Annotated[str, "Start address"],
+    end_addr: Annotated[str, "End address (exclusive)"],
+    initial_regs: Annotated[dict, "Initial register values (e.g. {'EAX': 0x1})"] = {},
+    max_steps: Annotated[int, "Max instructions to execute"] = 1000,
+) -> dict:
+    """Emulate a code snippet using Unicorn Engine (if available)"""
+    try:
+        import unicorn
+        from unicorn import x86_const
+    except ImportError:
+        return {"error": "Unicorn engine not installed in IDA Python environment"}
+        
+    try:
+        start_ea = parse_address(start_addr)
+        end_ea = parse_address(end_addr)
+        
+        # Detect arch
+        info = idaapi.get_inf_structure()
+        if info.procName != "metapc":
+            return {"error": "Only x86/x64 supported for now"}
+            
+        is_64 = info.is_64bit()
+        mode = unicorn.UC_MODE_64 if is_64 else unicorn.UC_MODE_32
+        uc = unicorn.Uc(unicorn.UC_ARCH_X86, mode)
+        
+        # Map memory
+        # We need to map the code segment and maybe data
+        # For simplicity, let's map a 2MB chunk around start_ea
+        page_size = 4096
+        base = start_ea & ~(page_size - 1)
+        size = 2 * 1024 * 1024 # 2MB
+        
+        uc.mem_map(base, size)
+        
+        # Read code from IDA and write to Unicorn
+        code_bytes = ida_bytes.get_bytes(base, size)
+        if code_bytes:
+            uc.mem_write(base, code_bytes)
+        else:
+            return {"error": "Failed to read memory from IDA"}
+            
+        # Setup registers
+        reg_map = {
+            "EAX": x86_const.UC_X86_REG_EAX,
+            "ECX": x86_const.UC_X86_REG_ECX,
+            "EDX": x86_const.UC_X86_REG_EDX,
+            "EBX": x86_const.UC_X86_REG_EBX,
+            "ESP": x86_const.UC_X86_REG_ESP,
+            "EBP": x86_const.UC_X86_REG_EBP,
+            "ESI": x86_const.UC_X86_REG_ESI,
+            "EDI": x86_const.UC_X86_REG_EDI,
+            "RAX": x86_const.UC_X86_REG_RAX,
+            "RCX": x86_const.UC_X86_REG_RCX,
+            "RDX": x86_const.UC_X86_REG_RDX,
+            "RBX": x86_const.UC_X86_REG_RBX,
+            "RSP": x86_const.UC_X86_REG_RSP,
+            "RBP": x86_const.UC_X86_REG_RBP,
+            "RSI": x86_const.UC_X86_REG_RSI,
+            "RDI": x86_const.UC_X86_REG_RDI,
+        }
+        
+        for reg, val in initial_regs.items():
+            if reg.upper() in reg_map:
+                uc.reg_write(reg_map[reg.upper()], int(str(val), 0))
+                
+        # Setup stack if ESP/RSP not provided
+        # Map a separate stack region
+        stack_base = 0x7F000000
+        stack_size = 0x100000
+        uc.mem_map(stack_base, stack_size)
+        
+        if "ESP" not in initial_regs and "RSP" not in initial_regs:
+            sp_reg = x86_const.UC_X86_REG_RSP if is_64 else x86_const.UC_X86_REG_ESP
+            uc.reg_write(sp_reg, stack_base + stack_size - 8)
+        
+        # Run
+        uc.emu_start(start_ea, end_ea, count=max_steps)
+        
+        # Capture final state
+        final_regs = {}
+        for r_name in (["RAX", "RBX", "RCX", "RDX"] if is_64 else ["EAX", "EBX", "ECX", "EDX"]):
+            final_regs[r_name] = hex(uc.reg_read(reg_map[r_name]))
+            
+        return {
+            "status": "success",
+            "final_registers": final_regs
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _perform_binary_search(
+    targets: list[str | int],
+    limit: int = 1000,
+    offset: int = 0,
+    timeout: int = 30,
+) -> list[dict]:
+    """Helper to perform optimized binary search for strings"""
+    results = []
+    start_time = time.time()
+
+    for pattern in targets:
+        pattern_str = str(pattern)
+        all_matches = []
+        count = 0
+
+        ea = ida_ida.inf_get_min_ea()
+        max_ea = ida_ida.inf_get_max_ea()
+
+        # Prepare search encodings: ASCII and UTF-16LE
+        encodings = []
+        try:
+            # 1. ASCII / UTF-8
+            encodings.append(pattern_str.encode("utf-8"))
+            # 2. UTF-16LE (Wide Char)
+            encodings.append(pattern_str.encode("utf-16le"))
+        except Exception:
+            pass
+
+        try:
+            for encoded_bytes in encodings:
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    break
+
+                # Build binary pattern string for IDA
+                # Format: "XX XX XX ..."
+                hex_pattern = " ".join([f"{b:02X}" for b in encoded_bytes])
+
+                # Search using available method
+                search_ea = ea
+                while True:
+                    if time.time() - start_time > timeout:
+                        break
+
+                    found_ea = idaapi.BADADDR
+
+                    try:
+                        if hasattr(idc, "find_binary"):
+                            found_ea = idc.find_binary(search_ea, idc.SEARCH_DOWN, hex_pattern)
+                        elif hasattr(idc, "FindBinary"):
+                            found_ea = idc.FindBinary(search_ea, idc.SEARCH_DOWN, hex_pattern)
+                        elif hasattr(ida_bytes, "bin_search"):
+                            # Fallback to bin_search with compiled pattern if idc fails
+                            pt_obj = ida_bytes.compiled_binpat_vec_t()
+                            ida_bytes.parse_binpat_str(pt_obj, search_ea, hex_pattern, 16)
+                            res = ida_bytes.bin_search(
+                                search_ea, max_ea, pt_obj, ida_bytes.BIN_SEARCH_FORWARD
+                            )
+                            if isinstance(res, tuple):
+                                found_ea = res[0]
+                            else:
+                                found_ea = res
+                    except Exception as e:
+                        print(f"[MCP-DEBUG] Search error: {e}")
+                        break
+
+                    search_ea = found_ea
+
+                    if search_ea == idaapi.BADADDR:
+                        break
+
+                    if search_ea >= max_ea:
+                        break
+
+                    all_matches.append(hex(search_ea))
+                    count += 1
+
+                    if count >= 10000 + offset:
+                        break
+
+                    search_ea += 1
+
+        except Exception as e:
+            print(f"[MCP] bin_search error: {e}")
+
+        # Deduplicate matches (in case ASCII and UTF-16 overlap, though unlikely for valid strings)
+        # and sort them
+        all_matches = sorted(list(set(all_matches)), key=lambda x: int(x, 16))
+
+        # Apply pagination
+        matches = all_matches[offset : offset + limit]
+        has_more = offset + limit < len(all_matches) or (
+            len(all_matches) >= 10000 + offset
+        )
+
+        # Check if we timed out
+        timed_out = time.time() - start_time > timeout
+        error_msg = "Search timed out, partial results returned" if timed_out else None
+
+        results.append(
+            {
+                "query": pattern_str,
+                "matches": matches,
+                "count": len(matches),
+                "cursor": {"next": offset + limit} if has_more else {"done": True},
+                "error": error_msg,
+            }
+        )
+
+        if timed_out:
+            break
+
+    return results
+
+
+@tool
+@idaread
 def search(
     type: Annotated[
         str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
@@ -929,6 +1388,7 @@ def search(
     ],
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
+    timeout: Annotated[int, "Max search time in seconds (default: 30)"] = 30,
 ) -> list[dict]:
     """Search for patterns in the binary (strings, immediate values, or references)"""
     if not isinstance(targets, list):
@@ -939,31 +1399,14 @@ def search(
         limit = 10000
 
     results = []
+    start_time = time.time()
 
     if type == "string":
-        # Search for strings containing pattern
-        all_strings = _get_cached_strings_dict()
-        for pattern in targets:
-            pattern_str = str(pattern)
-            all_matches = [
-                s["addr"]
-                for s in all_strings
-                if pattern_str.lower() in s["string"].lower()
-            ]
-
-            # Apply pagination
-            matches = all_matches[offset : offset + limit]
-            has_more = offset + limit < len(all_matches)
-
-            results.append(
-                {
-                    "query": pattern_str,
-                    "matches": matches,
-                    "count": len(matches),
-                    "cursor": {"next": offset + limit} if has_more else {"done": True},
-                    "error": None,
-                }
-            )
+        # Search for strings using binary search (fastest and most robust)
+        # This bypasses IDA's text rendering engine which can cause deadlocks in headless mode
+        # OPTIMIZED: O(file_size) binary scan
+        
+        results = _perform_binary_search(targets, limit, offset, timeout)
 
     elif type == "immediate":
         # Search for immediate values
@@ -1397,41 +1840,155 @@ def analyze_strings(
     if limit <= 0 or limit > 10000:
         limit = 10000
 
-    # Use cached strings to avoid rebuilding on every call
-    all_strings = _get_cached_strings_dict()
-
     results = []
+    
+    # Pre-fetch min/max addresses for validation
+    min_ea = ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
 
     for filt in filters:
-        pattern = filt.get("pattern", "").lower()
+        pattern = filt.get("pattern", "")
         min_length = filt.get("min_length", 0)
+        
+        # Optimize: If pattern is provided, use search() logic instead of iterating all strings
+        if pattern and len(pattern) > 3 and pattern != "*": # Only use search for reasonably long patterns
+             # Use the robust bin_search implementation via shared helper
+             # This is much faster for finding specific strings than iterating all strings
+             try:
+                 print(f"[MCP-DEBUG] Optimizing strings query with search(): {pattern}")
+                 # Directly call the helper, NOT the tool wrapper
+                 search_results = _perform_binary_search(targets=[pattern], limit=limit, offset=offset, timeout=60)
+                 
+                 # Convert search results to analyze_strings format
+                 final_matches = []
+                 for res in search_results:
+                     if res.get("error"):
+                         continue
+                     for m_addr_str in res.get("matches", []):
+                         ea = int(m_addr_str, 16)
+                         # Try to get string content at this address
+                         try:
+                             s_len = 0
+                             s_content = pattern # Default to pattern
+                             
+                             # Try to detect actual string length and content
+                             # This is a best-effort since we found a binary match
+                             detected_str_type = ida_nalt.get_str_type(ea)
+                             if detected_str_type:
+                                 content = idc.get_strlit_contents(ea, -1, detected_str_type)
+                                 if content:
+                                     s_content = content.decode("utf-8", errors="replace")
+                                     s_len = len(content)
+                             
+                             match = {
+                                 "addr": hex(ea),
+                                 "length": s_len,
+                                 "string": s_content,
+                                 "type": detected_str_type
+                             }
+                             
+                             # Add xrefs
+                             xrefs = [hex(x.frm) for x in idautils.XrefsTo(ea, 0)]
+                             match["xrefs"] = xrefs
+                             match["xref_count"] = len(xrefs)
+                             
+                             final_matches.append(match)
+                         except:
+                             pass
+                             
+                 results.append(
+                    {
+                        "filter": filt,
+                        "matches": final_matches,
+                        "count": len(final_matches),
+                        "total_estimated": len(final_matches), # Accurate for search
+                        "cursor": {"done": True}, # Search handles pagination internally but here we simplify
+                    }
+                 )
+                 continue # Skip to next filter
+             except Exception as e:
+                 print(f"[MCP] Optimized search failed, falling back to iteration: {e}")
 
-        # Find all matching strings
+        # Fallback to iteration for short patterns or wildcard
+        # Use idautils.Strings() generator directly instead of caching all
+        # This is O(N) where N is number of strings in binary
         all_matches = []
-        for s in all_strings:
-            if len(s["string"]) < min_length:
-                continue
-            if pattern and pattern not in s["string"].lower():
-                continue
+        count = 0
+        
+        try:
+            # Iterate strings
+            for s in idautils.Strings():
+                s_str = str(s)
+                
+                # Apply length filter
+                if len(s_str) < min_length:
+                    continue
+                    
+                # Apply pattern filter
+                if pattern:
+                    # Treat "*" as wildcard for "all"
+                    if pattern == "*":
+                        pass
+                    # Simple case-insensitive containment
+                    elif pattern.lower() not in s_str.lower():
+                        continue
+                
+                # Build result object
+                # Fix: idautils.Strings() returns StringItem which has strtype, not type
+                s_type = getattr(s, "strtype", 0)
+                
+                match = {
+                    "addr": hex(s.ea),
+                    "length": s.length,
+                    "string": s_str,
+                    "type": s_type
+                }
+                
+                # Add xref info (expensive operation, maybe make optional?)
+                # For large binaries, resolving xrefs for EVERY string is very slow.
+                # Let's only resolve xrefs for the paginated result?
+                # BUT, the tool contract implies we return xrefs.
+                # Optimization: Only get xref count first? No, idautils.XrefsTo is a generator.
+                
+                # Compromise: We collect all matches first (fast), then resolve xrefs only for the slice we return.
+                all_matches.append(match)
+                
+                # Safety break to prevent OOM on huge binaries if no filter
+                if len(all_matches) > 100000 and not pattern:
+                     # If we have too many results and no specific pattern, stop to avoid memory issues
+                     break
 
-            # Add xref info
-            s_ea = parse_address(s["addr"])
-            xrefs = [hex(x.frm) for x in idautils.XrefsTo(s_ea, 0)]
-            all_matches.append({**s, "xrefs": xrefs, "xref_count": len(xrefs)})
+        except Exception as e:
+            print(f"[MCP] Error iterating strings: {e}")
 
         # Apply pagination
         if limit > 0:
-            matches = all_matches[offset : offset + limit]
+            matches_slice = all_matches[offset : offset + limit]
             has_more = offset + limit < len(all_matches)
         else:
-            matches = all_matches[offset:]
+            matches_slice = all_matches[offset:]
             has_more = False
+
+        # Enrich the slice with Xrefs (Lazy loading)
+        final_matches = []
+        for m in matches_slice:
+            try:
+                ea = int(m["addr"], 16)
+                xrefs = [hex(x.frm) for x in idautils.XrefsTo(ea, 0)]
+                m["xrefs"] = xrefs
+                m["xref_count"] = len(xrefs)
+                final_matches.append(m)
+            except:
+                m["xrefs"] = []
+                m["xref_count"] = 0
+                final_matches.append(m)
 
         results.append(
             {
                 "filter": filt,
-                "matches": matches,
-                "count": len(matches),
+                "matches": final_matches,
+                "count": len(final_matches), # Count of returned items
+                "total_estimated": len(all_matches), # Total matches found
                 "cursor": {"next": offset + limit} if has_more else {"done": True},
             }
         )

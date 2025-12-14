@@ -74,7 +74,47 @@ def main():
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
     # TODO: with background=True the main thread (this one) does not fake any
     # work from @idaread, so we deadlock.
-    MCP_SERVER.serve(host=args.host, port=args.port, background=False)
+    
+    # Enable headless mode in sync module
+    from ida_pro_mcp.ida_mcp import sync
+    import queue
+    import time
+    
+    sync.HEADLESS_MODE = True
+    
+    # Start server in background thread
+    MCP_SERVER.serve(host=args.host, port=args.port, background=True)
+    
+    # Main thread becomes the task executor
+    logger.info("Entering headless event loop...")
+    
+    # Try to find a way to pump IDA's loop
+    import ctypes
+    
+    last_heartbeat = time.time()
+    
+    while True:
+        try:
+            # Heartbeat every 60 seconds (keep it quiet)
+            if time.time() - last_heartbeat > 60:
+                logger.debug("Main loop heartbeat: IDA is responsive")
+                last_heartbeat = time.time()
+
+            # Poll for tasks from the sync module
+            # We use a short timeout to allow signal handlers to interrupt if needed
+            task = sync.HEADLESS_QUEUE.get(timeout=0.001)
+            try:
+                task()
+            except Exception as e:
+                logger.error(f"Error executing task: {e}")
+        except queue.Empty:
+            # We need to let IDA breathe. In idalib, the main thread IS IDA's thread.
+            # We are blocking it with this while loop.
+            # We need to yield control back to IDA occasionally if possible, 
+            # or ensure we are not preventing internal processing.
+            pass
+        except KeyboardInterrupt:
+            break
 
 
 if __name__ == "__main__":
