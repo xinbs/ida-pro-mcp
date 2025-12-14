@@ -152,11 +152,19 @@ async def list_files():
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    filename = file.filename
+    
+    # Security: Append "_" to executable extensions to prevent accidental execution
+    executable_exts = {".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".msi", ".com", ".scr", ".pif"}
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in executable_exts:
+        filename += "_"
+        
+    file_path = os.path.join(UPLOAD_DIR, filename)
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        return {"filename": file.filename, "status": "uploaded"}
+        return {"filename": filename, "status": "uploaded"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
