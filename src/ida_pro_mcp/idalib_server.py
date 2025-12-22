@@ -8,7 +8,7 @@ from pathlib import Path
 import idapro
 import ida_auto
 
-from ida_pro_mcp.ida_mcp import MCP_SERVER
+from ida_pro_mcp.ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler
 
 logger = logging.getLogger(__name__)
 

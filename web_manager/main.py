@@ -212,6 +212,10 @@ async def start_process(req: StartRequest):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Verify IDA_DIR
+    if not os.path.exists(IDA_DIR):
+        raise HTTPException(status_code=500, detail=f"IDA Directory not found at: {IDA_DIR}. Please set IDADIR environment variable to your IDA installation path.")
+
     # Prepare environment
     env = os.environ.copy()
     env["PYTHONPATH"] = SRC_DIR

@@ -363,7 +363,41 @@ class McpServer:
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
-        return urlparse(origin).hostname in ("localhost", "127.0.0.1", "::1")
+        hostname = urlparse(origin).hostname
+        if not hostname:
+            return False
+
+        if hostname in ("localhost", "127.0.0.1", "::1"):
+            return True
+        
+        # Allow private IP ranges (LAN)
+        # 192.168.x.x
+        if hostname.startswith("192.168."):
+            return True
+        # 10.x.x.x
+        if hostname.startswith("10."):
+            return True
+        # 172.16.x.x - 172.31.x.x
+        if hostname.startswith("172."):
+            try:
+                parts = hostname.split(".")
+                if len(parts) == 4:
+                    second_octet = int(parts[1])
+                    if 16 <= second_octet <= 31:
+                        return True
+            except (IndexError, ValueError):
+                pass
+        
+        # Also allow connection to the bound interface address
+        if self._http_server:
+            try:
+                server_host = self._http_server.server_address[0]
+                if server_host == hostname:
+                    return True
+            except Exception:
+                pass
+                
+        return False
 
     def _mcp_ping(self, _meta: dict | None = None) -> dict:
         """MCP ping method"""
