@@ -53,8 +53,21 @@ def main():
 
     # TODO: add a tool for specifying the idb/input file (sandboxed)
     logger.info("opening database: %s", args.input_path)
-    if idapro.open_database(str(args.input_path), run_auto_analysis=True):
-        raise RuntimeError("failed to analyze input file")
+    
+    # Initialize headless mode BEFORE opening database to ensure hooks are ready
+    from ida_pro_mcp.ida_mcp import sync
+    sync.HEADLESS_MODE = True
+    
+    # We must ensure IDAlib is properly initialized.
+    try:
+        # Revert: use simple string conversion as resolve() might cause issues on Windows
+        if idapro.open_database(str(args.input_path), run_auto_analysis=True):
+            raise RuntimeError("failed to analyze input file")
+    except OSError as e:
+        # Catch the specific access violation if possible, or just log critical error
+        logger.critical(f"Critical error opening database: {e}")
+        logger.critical("This often happens if the input file format is not recognized or IDA loader crashes.")
+        sys.exit(1)
 
     logger.debug("idalib: waiting for analysis...")
     ida_auto.auto_wait()
@@ -73,17 +86,14 @@ def main():
 
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
     # TODO: with background=True the main thread (this one) does not fake any
-    # work from @idaread, so we deadlock.
+    # work from @idasync, so we deadlock.
     
     # Enable headless mode in sync module
-    from ida_pro_mcp.ida_mcp import sync
     import queue
     import time
     
-    sync.HEADLESS_MODE = True
-    
     # Start server in background thread
-    MCP_SERVER.serve(host=args.host, port=args.port, background=True)
+    MCP_SERVER.serve(host=args.host, port=args.port, background=True, request_handler=IdaMcpHttpRequestHandler)
     
     # Main thread becomes the task executor
     logger.info("Entering headless event loop...")

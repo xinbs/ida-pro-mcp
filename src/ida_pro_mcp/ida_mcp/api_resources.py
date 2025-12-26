@@ -6,15 +6,29 @@ Use tools for actions that modify state or perform expensive computations.
 
 from typing import Annotated
 
+import ida_dbg
+import ida_entry
 import ida_funcs
+import ida_idd
+import ida_kernwin
 import ida_nalt
 import ida_segment
+import ida_typeinf
 import idaapi
 import idautils
 import idc
 
 from .rpc import resource
-from .sync import idaread
+from .sync import idasync
+from .tests import (
+    test,
+    assert_has_keys,
+    assert_valid_address,
+    assert_non_empty,
+    assert_is_list,
+    get_any_function,
+    get_any_string,
+)
 from .utils import (
     Function,
     Global,
@@ -37,7 +51,7 @@ from .utils import (
 
 
 @resource("ida://idb/metadata")
-@idaread
+@idasync
 def idb_metadata_resource() -> Metadata:
     """Get IDB file metadata (path, arch, base address, size, hashes)"""
     import hashlib
@@ -72,8 +86,19 @@ def idb_metadata_resource() -> Metadata:
     )
 
 
+@test()
+def test_resource_idb_metadata():
+    """idb_metadata_resource returns valid metadata with all required fields"""
+    meta = idb_metadata_resource()
+    assert_has_keys(meta, "path", "module", "base", "size", "md5", "sha256")
+    assert_non_empty(meta["path"])
+    assert_non_empty(meta["module"])
+    assert_valid_address(meta["base"])
+    assert_valid_address(meta["size"])
+
+
 @resource("ida://idb/segments")
-@idaread
+@idasync
 def idb_segments_resource() -> list[Segment]:
     """Get all memory segments with permissions"""
     segments = []
@@ -100,18 +125,42 @@ def idb_segments_resource() -> list[Segment]:
     return segments
 
 
+@test()
+def test_resource_idb_segments():
+    """idb_segments_resource returns list of segments with proper structure"""
+    segs = idb_segments_resource()
+    assert_is_list(segs, min_length=1)
+    seg = segs[0]
+    assert_has_keys(seg, "name", "start", "end", "size", "permissions")
+    assert_valid_address(seg["start"])
+    assert_valid_address(seg["end"])
+    assert_valid_address(seg["size"])
+
+
 @resource("ida://idb/entrypoints")
-@idaread
+@idasync
 def idb_entrypoints_resource() -> list[dict]:
     """Get entry points (main, TLS callbacks, etc.)"""
     entrypoints = []
-    entry_count = ida_nalt.get_entry_qty()
+    entry_count = ida_entry.get_entry_qty()
     for i in range(entry_count):
-        ordinal = ida_nalt.get_entry_ordinal(i)
-        ea = ida_nalt.get_entry(ordinal)
-        name = ida_nalt.get_entry_name(ordinal)
+        ordinal = ida_entry.get_entry_ordinal(i)
+        ea = ida_entry.get_entry(ordinal)
+        name = ida_entry.get_entry_name(ordinal)
         entrypoints.append({"addr": hex(ea), "name": name, "ordinal": ordinal})
     return entrypoints
+
+
+@test()
+def test_resource_idb_entrypoints():
+    """idb_entrypoints_resource returns list of entry points"""
+    result = idb_entrypoints_resource()
+    assert_is_list(result)
+    # If there are entry points, check structure
+    if result:
+        entry = result[0]
+        assert_has_keys(entry, "addr", "name", "ordinal")
+        assert_valid_address(entry["addr"])
 
 
 # ============================================================================
@@ -120,7 +169,7 @@ def idb_entrypoints_resource() -> list[dict]:
 
 
 @resource("ida://functions")
-@idaread
+@idasync
 def functions_resource(
     filter: Annotated[str, "Optional glob pattern to filter by name"] = "",
     offset: Annotated[int, "Starting index"] = 0,
@@ -146,8 +195,20 @@ def functions_resource(
     return paginate(funcs, offset, count)
 
 
+@test()
+def test_resource_functions():
+    """functions_resource returns paginated list of functions"""
+    result = functions_resource()
+    assert_has_keys(result, "data", "next_offset")
+    assert_is_list(result["data"], min_length=1)
+    # Check first function has required keys
+    fn = result["data"][0]
+    assert_has_keys(fn, "addr", "name", "size")
+    assert_valid_address(fn["addr"])
+
+
 @resource("ida://function/{addr}")
-@idaread
+@idasync
 def function_addr_resource(
     addr: Annotated[str, "Function address (hex or decimal)"],
 ) -> dict:
@@ -180,8 +241,23 @@ def function_addr_resource(
     }
 
 
+@test()
+def test_resource_function_addr():
+    """function_addr_resource returns function details for valid address"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        return  # Skip if no functions
+
+    result = function_addr_resource(fn_addr)
+    # Should not have error for valid function
+    assert "error" not in result or result.get("error") is None
+    assert_has_keys(result, "addr", "name", "size", "end_ea", "flags")
+    assert_valid_address(result["addr"])
+    assert_valid_address(result["end_ea"])
+
+
 @resource("ida://globals")
-@idaread
+@idasync
 def globals_resource(
     filter: Annotated[str, "Optional glob pattern to filter by name"] = "",
     offset: Annotated[int, "Starting index"] = 0,
@@ -201,8 +277,21 @@ def globals_resource(
     return paginate(globals_list, offset, count)
 
 
+@test()
+def test_resource_globals():
+    """globals_resource returns paginated list of globals"""
+    result = globals_resource()
+    assert_has_keys(result, "data", "next_offset")
+    assert_is_list(result["data"])
+    # If there are globals, check structure
+    if result["data"]:
+        glob = result["data"][0]
+        assert_has_keys(glob, "addr", "name")
+        assert_valid_address(glob["addr"])
+
+
 @resource("ida://global/{name_or_addr}")
-@idaread
+@idasync
 def global_id_resource(name_or_addr: Annotated[str, "Global name or address"]) -> dict:
     """Get specific global variable details"""
     # Try as address first
@@ -234,13 +323,29 @@ def global_id_resource(name_or_addr: Annotated[str, "Global name or address"]) -
     }
 
 
+@test()
+def test_resource_global_id():
+    """global_id_resource returns global details for valid address"""
+    # First get a global from globals_resource
+    result = globals_resource()
+    if not result["data"]:
+        return  # Skip if no globals
+
+    glob = result["data"][0]
+    # Test by address
+    detail = global_id_resource(glob["addr"])
+    assert "error" not in detail or detail.get("error") is None
+    assert_has_keys(detail, "addr", "name")
+    assert_valid_address(detail["addr"])
+
+
 # ============================================================================
 # Data Resources (strings & imports)
 # ============================================================================
 
 
 @resource("ida://strings")
-@idaread
+@idasync
 def strings_resource(
     filter: Annotated[str, "Optional pattern to match in strings"] = "",
     offset: Annotated[int, "Starting index"] = 0,
@@ -265,8 +370,21 @@ def strings_resource(
     return paginate(strings, offset, count)
 
 
+@test()
+def test_resource_strings():
+    """strings_resource returns paginated list of strings"""
+    result = strings_resource()
+    assert_has_keys(result, "data", "next_offset")
+    assert_is_list(result["data"])
+    # If there are strings, check structure
+    if result["data"]:
+        string_item = result["data"][0]
+        assert_has_keys(string_item, "addr", "length", "string")
+        assert_valid_address(string_item["addr"])
+
+
 @resource("ida://string/{addr}")
-@idaread
+@idasync
 def string_addr_resource(addr: Annotated[str, "String address"]) -> dict:
     """Get specific string details"""
     ea = parse_address(addr)
@@ -284,8 +402,21 @@ def string_addr_resource(addr: Annotated[str, "String address"]) -> dict:
         return {"error": str(e)}
 
 
+@test()
+def test_resource_string_addr():
+    """string_addr_resource returns string details for valid address"""
+    str_addr = get_any_string()
+    if not str_addr:
+        return  # Skip if no strings
+
+    result = string_addr_resource(str_addr)
+    assert "error" not in result or result.get("error") is None
+    assert_has_keys(result, "addr", "length", "string", "type")
+    assert_valid_address(result["addr"])
+
+
 @resource("ida://imports")
-@idaread
+@idasync
 def imports_resource(
     offset: Annotated[int, "Starting index"] = 0,
     count: Annotated[int, "Maximum results (0=all)"] = 50,
@@ -309,8 +440,21 @@ def imports_resource(
     return paginate(imports, offset, count)
 
 
+@test()
+def test_resource_imports():
+    """imports_resource returns paginated list of imports"""
+    result = imports_resource()
+    assert_has_keys(result, "data", "next_offset")
+    assert_is_list(result["data"])
+    # If there are imports, check structure
+    if result["data"]:
+        imp = result["data"][0]
+        assert_has_keys(imp, "addr", "imported_name", "module")
+        assert_valid_address(imp["addr"])
+
+
 @resource("ida://import/{name}")
-@idaread
+@idasync
 def import_name_resource(name: Annotated[str, "Import name"]) -> dict:
     """Get specific import details"""
     nimps = ida_nalt.get_import_module_qty()
@@ -338,33 +482,62 @@ def import_name_resource(name: Annotated[str, "Import name"]) -> dict:
     return {"error": f"Import not found: {name}"}
 
 
+@test()
+def test_resource_import_name():
+    """import_name_resource returns import details for valid name"""
+    # First get an import from imports_resource
+    result = imports_resource()
+    if not result["data"]:
+        return  # Skip if no imports
+
+    imp = result["data"][0]
+    # Test by name
+    detail = import_name_resource(imp["imported_name"])
+    assert "error" not in detail or detail.get("error") is None
+    assert_has_keys(detail, "addr", "name", "module", "ordinal")
+    assert_valid_address(detail["addr"])
+
+
 @resource("ida://exports")
-@idaread
+@idasync
 def exports_resource(
     offset: Annotated[int, "Starting index"] = 0,
     count: Annotated[int, "Maximum results (0=all)"] = 50,
 ) -> Page[dict]:
     """Get all exported functions"""
     exports = []
-    entry_count = ida_nalt.get_entry_qty()
+    entry_count = ida_entry.get_entry_qty()
     for i in range(entry_count):
-        ordinal = ida_nalt.get_entry_ordinal(i)
-        ea = ida_nalt.get_entry(ordinal)
-        name = ida_nalt.get_entry_name(ordinal)
+        ordinal = ida_entry.get_entry_ordinal(i)
+        ea = ida_entry.get_entry(ordinal)
+        name = ida_entry.get_entry_name(ordinal)
         exports.append({"addr": hex(ea), "name": name, "ordinal": ordinal})
 
     return paginate(exports, offset, count)
 
 
+@test()
+def test_resource_exports():
+    """exports_resource returns paginated list of exports"""
+    result = exports_resource()
+    assert_has_keys(result, "data", "next_offset")
+    assert_is_list(result["data"])
+    # If there are exports, check structure
+    if result["data"]:
+        export = result["data"][0]
+        assert_has_keys(export, "addr", "name", "ordinal")
+        assert_valid_address(export["addr"])
+
+
 @resource("ida://export/{name}")
-@idaread
+@idasync
 def export_name_resource(name: Annotated[str, "Export name"]) -> dict:
     """Get specific export details"""
-    entry_count = ida_nalt.get_entry_qty()
+    entry_count = ida_entry.get_entry_qty()
     for i in range(entry_count):
-        ordinal = ida_nalt.get_entry_ordinal(i)
-        ea = ida_nalt.get_entry(ordinal)
-        entry_name = ida_nalt.get_entry_name(ordinal)
+        ordinal = ida_entry.get_entry_ordinal(i)
+        ea = ida_entry.get_entry(ordinal)
+        entry_name = ida_entry.get_entry_name(ordinal)
 
         if entry_name == name:
             return {
@@ -376,19 +549,37 @@ def export_name_resource(name: Annotated[str, "Export name"]) -> dict:
     return {"error": f"Export not found: {name}"}
 
 
+@test()
+def test_resource_export_name():
+    """export_name_resource returns export details for valid name"""
+    # First get an export from exports_resource
+    result = exports_resource()
+    if not result["data"]:
+        return  # Skip if no exports
+
+    export = result["data"][0]
+    if not export["name"]:
+        return  # Skip if export has no name
+
+    # Test by name
+    detail = export_name_resource(export["name"])
+    assert "error" not in detail or detail.get("error") is None
+    assert_has_keys(detail, "addr", "name", "ordinal")
+    assert_valid_address(detail["addr"])
+
+
 # ============================================================================
 # Type Resources (structures & types)
 # ============================================================================
 
 
 @resource("ida://types")
-@idaread
+@idasync
 def types_resource() -> list[dict]:
     """Get all local types"""
-    import ida_typeinf
-
     types = []
-    for ordinal in range(1, ida_typeinf.get_ordinal_qty(None)):
+    limit = ida_typeinf.get_ordinal_limit()
+    for ordinal in range(1, limit):
         tif = ida_typeinf.tinfo_t()
         if tif.get_numbered_type(None, ordinal):
             name = tif.get_type_name()
@@ -396,65 +587,92 @@ def types_resource() -> list[dict]:
     return types
 
 
+@test()
+def test_resource_types():
+    """types_resource returns list of local types"""
+    result = types_resource()
+    assert_is_list(result)
+    # If there are types, check structure
+    if result:
+        type_item = result[0]
+        assert_has_keys(type_item, "ordinal", "name", "type")
+
+
 @resource("ida://structs")
-@idaread
+@idasync
 def structs_resource() -> list[dict]:
     """Get all structures/unions"""
-    import ida_struct
-
     structs = []
-    for idx in range(ida_struct.get_struc_qty()):
-        tid = ida_struct.get_struc_by_idx(idx)
-        struc = ida_struct.get_struc(tid)
-        if struc:
+    limit = ida_typeinf.get_ordinal_limit()
+    for ordinal in range(1, limit):
+        tif = ida_typeinf.tinfo_t()
+        tif.get_numbered_type(None, ordinal)
+        if tif.is_udt():
             structs.append(
                 {
-                    "name": ida_struct.get_struc_name(tid),
-                    "size": hex(ida_struct.get_struc_size(struc)),
-                    "is_union": struc.is_union(),
+                    "name": tif.get_type_name(),
+                    "size": hex(tif.get_size()),
+                    "is_union": tif.is_union(),
                 }
             )
     return structs
 
 
+@test()
+def test_resource_structs():
+    """structs_resource returns list of structures"""
+    result = structs_resource()
+    assert_is_list(result)
+    # If there are structs, check structure
+    if result:
+        struct_item = result[0]
+        assert_has_keys(struct_item, "name", "size", "is_union")
+        assert_valid_address(struct_item["size"])
+
+
 @resource("ida://struct/{name}")
-@idaread
+@idasync
 def struct_name_resource(name: Annotated[str, "Structure name"]) -> dict:
     """Get structure definition with fields"""
-    import ida_struct
-    import ida_typeinf
-
-    sid = ida_struct.get_struc_id(name)
-    if sid == idaapi.BADADDR:
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(None, name):
         return {"error": f"Structure not found: {name}"}
 
-    struc = ida_struct.get_struc(sid)
-    if not struc:
-        return {"error": f"Structure not found: {name}"}
+    if not tif.is_udt():
+        return {"error": f"'{name}' is not a structure/union"}
+
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        return {"error": f"Failed to get structure details for: {name}"}
 
     members = []
-    for i in range(struc.memqty):
-        member = struc.get_member(i)
-        if member:
-            mname = ida_struct.get_member_name(member.id)
-            tif = ida_typeinf.tinfo_t()
-            if ida_struct.get_member_tinfo(tif, member):
-                type_str = str(tif)
-            else:
-                type_str = "unknown"
-
-            members.append(
-                StructureMember(
-                    name=mname,
-                    offset=hex(member.soff),
-                    size=hex(ida_struct.get_member_size(member)),
-                    type=type_str,
-                )
+    for udm in udt:
+        members.append(
+            StructureMember(
+                name=udm.name,
+                offset=hex(udm.offset // 8),
+                size=hex(udm.size // 8),
+                type=str(udm.type),
             )
+        )
 
-    return StructureDefinition(
-        name=name, size=hex(ida_struct.get_struc_size(struc)), members=members
-    )
+    return StructureDefinition(name=name, size=hex(tif.get_size()), members=members)
+
+
+@test()
+def test_resource_struct_name():
+    """struct_name_resource returns struct details for valid name"""
+    # First get a struct from structs_resource
+    struct_list = structs_resource()
+    if not struct_list:
+        return  # Skip if no structs
+
+    name = struct_list[0]["name"]
+    result = struct_name_resource(name)
+    assert "error" not in result or result.get("error") is None
+    assert_has_keys(result, "name", "size", "members")
+    assert_valid_address(result["size"])
+    assert_is_list(result["members"])
 
 
 # ============================================================================
@@ -463,7 +681,7 @@ def struct_name_resource(name: Annotated[str, "Structure name"]) -> dict:
 
 
 @resource("ida://xrefs/to/{addr}")
-@idaread
+@idasync
 def xrefs_to_addr_resource(addr: Annotated[str, "Target address"]) -> list[dict]:
     """Get cross-references to address"""
     ea = parse_address(addr)
@@ -478,8 +696,25 @@ def xrefs_to_addr_resource(addr: Annotated[str, "Target address"]) -> list[dict]
     return xrefs
 
 
+@test()
+def test_resource_xrefs_to():
+    """xrefs_to_addr_resource returns list of cross-references to address"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        return  # Skip if no functions
+
+    result = xrefs_to_addr_resource(fn_addr)
+    assert_is_list(result)
+    # If there are xrefs, check structure
+    if result:
+        xref = result[0]
+        assert_has_keys(xref, "addr", "type")
+        assert_valid_address(xref["addr"])
+        assert xref["type"] in ("code", "data")
+
+
 @resource("ida://xrefs/from/{addr}")
-@idaread
+@idasync
 def xrefs_from_resource(addr: Annotated[str, "Source address"]) -> list[dict]:
     """Get cross-references from address"""
     ea = parse_address(addr)
@@ -494,8 +729,25 @@ def xrefs_from_resource(addr: Annotated[str, "Source address"]) -> list[dict]:
     return xrefs
 
 
+@test()
+def test_resource_xrefs_from():
+    """xrefs_from_resource returns list of cross-references from address"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        return  # Skip if no functions
+
+    result = xrefs_from_resource(fn_addr)
+    assert_is_list(result)
+    # If there are xrefs, check structure
+    if result:
+        xref = result[0]
+        assert_has_keys(xref, "addr", "type")
+        assert_valid_address(xref["addr"])
+        assert xref["type"] in ("code", "data")
+
+
 @resource("ida://stack/{func_addr}")
-@idaread
+@idasync
 def stack_func_resource(func_addr: Annotated[str, "Function address"]) -> dict:
     """Get stack frame variables for a function"""
     from .utils import get_stack_frame_variables_internal
@@ -505,17 +757,28 @@ def stack_func_resource(func_addr: Annotated[str, "Function address"]) -> dict:
     return {"addr": hex(ea), "variables": variables}
 
 
+@test()
+def test_resource_stack_func():
+    """stack_func_resource returns stack frame for valid function"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        return  # Skip if no functions
+
+    result = stack_func_resource(fn_addr)
+    assert_has_keys(result, "addr", "variables")
+    assert_valid_address(result["addr"])
+    assert_is_list(result["variables"])
+
+
 # ============================================================================
 # Context Resources (current state)
 # ============================================================================
 
 
 @resource("ida://cursor")
-@idaread
+@idasync
 def cursor_resource() -> dict:
     """Get current cursor position and function"""
-    import ida_kernwin
-
     ea = ida_kernwin.get_screen_ea()
     func = idaapi.get_func(ea)
 
@@ -534,16 +797,41 @@ def cursor_resource() -> dict:
     return result
 
 
+@test()
+def test_resource_cursor():
+    """cursor_resource returns current cursor position"""
+    result = cursor_resource()
+    assert_has_keys(result, "addr")
+    assert_valid_address(result["addr"])
+    # Function key is optional, but if present should have proper structure
+    if "function" in result and result["function"]:
+        assert_has_keys(result["function"], "addr", "name")
+        assert_valid_address(result["function"]["addr"])
+
+
 @resource("ida://selection")
-@idaread
+@idasync
 def selection_resource() -> dict:
     """Get current selection range (if any)"""
-    import ida_kernwin
-
     start = ida_kernwin.read_range_selection(None)
     if start:
         return {"start": hex(start[0]), "end": hex(start[1]) if start[1] else None}
     return {"selection": None}
+
+
+@test()
+def test_resource_selection():
+    """selection_resource returns selection or null"""
+    result = selection_resource()
+    # Result should have either start/end or selection key
+    assert isinstance(result, dict)
+    if "selection" in result:
+        # No selection case
+        assert result["selection"] is None
+    else:
+        # Selection exists
+        assert_has_keys(result, "start")
+        assert_valid_address(result["start"])
 
 
 # ============================================================================
@@ -552,11 +840,9 @@ def selection_resource() -> dict:
 
 
 @resource("ida://debug/breakpoints")
-@idaread
+@idasync
 def debug_breakpoints_resource() -> list[dict]:
     """Get all debugger breakpoints"""
-    import ida_dbg
-
     if not ida_dbg.is_debugger_on():
         return []
 
@@ -576,13 +862,22 @@ def debug_breakpoints_resource() -> list[dict]:
     return breakpoints
 
 
+@test()
+def test_resource_debug_breakpoints():
+    """debug_breakpoints_resource returns list (empty if debugger not active)"""
+    result = debug_breakpoints_resource()
+    assert_is_list(result)
+    # If there are breakpoints, check structure
+    if result:
+        bp = result[0]
+        assert_has_keys(bp, "addr", "enabled", "type", "size")
+        assert_valid_address(bp["addr"])
+
+
 @resource("ida://debug/registers")
-@idaread
+@idasync
 def debug_registers_resource() -> dict:
     """Get current debugger register values"""
-    import ida_dbg
-    import ida_idd
-
     if not ida_dbg.is_debugger_on():
         return {"error": "Debugger not active"}
 
@@ -596,12 +891,23 @@ def debug_registers_resource() -> dict:
     return {"registers": registers}
 
 
+@test()
+def test_resource_debug_registers():
+    """debug_registers_resource returns error or registers dict"""
+    result = debug_registers_resource()
+    assert isinstance(result, dict)
+    # Either has error (debugger not active) or registers
+    if "error" in result:
+        assert result["error"] == "Debugger not active"
+    else:
+        assert_has_keys(result, "registers")
+        assert isinstance(result["registers"], dict)
+
+
 @resource("ida://debug/callstack")
-@idaread
+@idasync
 def debug_callstack_resource() -> list[dict]:
     """Get current debugger call stack"""
-    import ida_dbg
-
     if not ida_dbg.is_debugger_on():
         return []
 
@@ -620,3 +926,15 @@ def debug_callstack_resource() -> list[dict]:
                 }
             )
     return stack
+
+
+@test()
+def test_resource_debug_callstack():
+    """debug_callstack_resource returns list (empty if debugger not active)"""
+    result = debug_callstack_resource()
+    assert_is_list(result)
+    # If there are frames, check structure
+    if result:
+        frame = result[0]
+        assert_has_keys(frame, "index", "addr")
+        assert_valid_address(frame["addr"])

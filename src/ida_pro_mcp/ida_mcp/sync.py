@@ -102,8 +102,8 @@ def sync_wrapper(ff, safety_mode: IDASafety):
         idc.batch(old_batch)
 
 
-def idawrite(f):
-    """Decorator for marking a function as modifying the IDB."""
+def idasync(f):
+    """Run the function on the IDA main thread in write mode."""
 
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
@@ -113,17 +113,9 @@ def idawrite(f):
 
     return wrapper
 
-
-def idaread(f):
-    """Decorator for marking a function as reading from the IDB."""
-
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        ff = functools.partial(f, *args, **kwargs)
-        ff.__name__ = f.__name__
-        return sync_wrapper(ff, idaapi.MFF_READ)
-
-    return wrapper
+# Backward compatibility aliases
+idawrite = idasync
+idaread = idasync
 
 
 def is_window_active():

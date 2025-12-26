@@ -104,6 +104,7 @@ class FileInfo(BaseModel):
     filename: str
     size: int
     path: str
+    has_intermediate_files: bool = False
 
 class ProcessStatus(BaseModel):
     running: bool
@@ -131,6 +132,21 @@ def log_message(message: str):
         asyncio.run_coroutine_threadsafe(log_manager.broadcast(message), main_loop)
 
 # Helper Functions
+def has_intermediate_files(filename: str) -> bool:
+    """Check if any intermediate files exist for a given filename"""
+    base_path = os.path.join(UPLOAD_DIR, filename)
+    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".dmp"]
+    
+    root, _ = os.path.splitext(base_path)
+    for ext in exts:
+        # Check binary.id0
+        if os.path.exists(root + ext):
+            return True
+        # Check binary.exe.id0
+        if os.path.exists(base_path + ext):
+            return True
+    return False
+
 def get_files() -> List[FileInfo]:
     files = []
     if os.path.exists(UPLOAD_DIR):
@@ -144,7 +160,8 @@ def get_files() -> List[FileInfo]:
                 files.append(FileInfo(
                     filename=f,
                     size=os.path.getsize(path),
-                    path=path
+                    path=path,
+                    has_intermediate_files=has_intermediate_files(f)
                 ))
     return sorted(files, key=lambda x: x.filename)
 
@@ -230,8 +247,58 @@ async def delete_file(filename: str):
     file_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(file_path):
         os.remove(file_path)
+        # Also try to clean up intermediate files
+        try:
+            clean_intermediate_files(filename)
+        except:
+            pass
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="File not found")
+
+@app.post("/api/cleanup/{filename}")
+async def cleanup_intermediate_files_endpoint(filename: str):
+    """Manually clean up IDA intermediate files (.id0, .id1, .nam, etc)"""
+    if clean_intermediate_files(filename):
+        return {"status": "cleaned"}
+    else:
+        # Not finding files is also a success (already clean)
+        return {"status": "cleaned", "message": "No intermediate files found"}
+
+def clean_intermediate_files(filename: str) -> bool:
+    """Helper to remove .id0, .id1, .nam, .til, .i64, .dmp files"""
+    cleaned = False
+    base_path = os.path.join(UPLOAD_DIR, filename)
+    
+    # Extensions to clean
+    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".dmp"]
+    
+    # 1. Check exact matches (e.g. binary.exe -> binary.id0) - IDA < 7 style or some settings
+    # 2. Check appended matches (e.g. binary.exe -> binary.exe.id0) - Common IDA style
+    
+    # Case A: binary.id0 (replacing extension)
+    root, _ = os.path.splitext(base_path)
+    for ext in exts:
+        p = root + ext
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                log_message(f"[CLEANUP] Removed {os.path.basename(p)}")
+                cleaned = True
+            except Exception as e:
+                log_message(f"[CLEANUP] Failed to remove {os.path.basename(p)}: {e}")
+
+    # Case B: binary.exe.id0 (appending extension)
+    for ext in exts:
+        p = base_path + ext
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                log_message(f"[CLEANUP] Removed {os.path.basename(p)}")
+                cleaned = True
+            except Exception as e:
+                log_message(f"[CLEANUP] Failed to remove {os.path.basename(p)}: {e}")
+                
+    return cleaned
 
 @app.get("/api/status", response_model=ProcessStatus)
 async def get_status():
@@ -277,6 +344,9 @@ async def start_process(req: StartRequest):
     env = os.environ.copy()
     env["PYTHONPATH"] = SRC_DIR
     env["IDADIR"] = IDA_DIR
+    
+    # Force output buffering off to ensure real-time logs
+    env["PYTHONUNBUFFERED"] = "1"
     
     # Construct command
     cmd = [

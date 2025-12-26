@@ -1,6 +1,5 @@
 import re
 import sys
-import logging
 import time
 import uuid
 import json
@@ -71,8 +70,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         """Override to suppress default logging or customize"""
-        # logging.getLogger().info(f"[MCP] {self.client_address[0]} - {format % args}")
-        print(f"[MCP] {self.client_address[0]} - {format % args}", flush=True)
+        pass
 
     def send_cors_headers(self, *, preflight = False):
         origin = self.headers.get("Origin", "")
@@ -106,7 +104,6 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def handle(self):
         """Override to add error handling for connection errors"""
         try:
-            print(f"[MCP] New connection from {self.client_address}", flush=True)
             super().handle()
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
             # Client disconnected - normal, suppress traceback
@@ -273,9 +270,7 @@ class McpServer:
 
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
-        # ALWAYS use ThreadingHTTPServer because SSE requires concurrent connections.
-        # Even if running in foreground (background=False), we need threads for handlers.
-        self._http_server = ThreadingHTTPServer(
+        self._http_server = (ThreadingHTTPServer if background else HTTPServer)(
             (host, port), request_handler, bind_and_activate=False
         )
         self._http_server.allow_reuse_address = False
@@ -432,6 +427,7 @@ class McpServer:
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/call method"""
+        print(f"[MCP] Calling tool: {name} with args: {json.dumps(arguments, default=str)[:200]}")
         # Wrap tool call in JSON-RPC request
         tool_response = self.tools.dispatch({
             "jsonrpc": "2.0",
@@ -444,11 +440,13 @@ class McpServer:
         # Check for error response
         if "error" in tool_response:
             error = tool_response["error"]
+            print(f"[MCP] Tool '{name}' failed: {error['message']}")
             return {
                 "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
                 "isError": True,
             }
 
+        print(f"[MCP] Tool '{name}' completed successfully")
         result = tool_response.get("result")
         return {
             "content": [{"type": "text", "text": json.dumps(result, indent=2)}],

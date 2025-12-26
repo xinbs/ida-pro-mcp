@@ -9,8 +9,8 @@ import ida_nalt
 import ida_typeinf
 import ida_segment
 
-from .rpc import tool, test
-from .sync import idaread
+from .rpc import tool
+from .sync import idasync
 from .utils import (
     Metadata,
     Function,
@@ -34,6 +34,14 @@ from .utils import (
     DEMANGLED_TO_EA,
 )
 from .sync import IDAError
+from .tests import (
+    test,
+    assert_has_keys,
+    assert_valid_address,
+    assert_non_empty,
+    assert_is_list,
+    get_any_function,
+)
 
 
 # ============================================================================
@@ -77,7 +85,7 @@ def _get_cached_strings() -> list[String]:
 
 
 @tool
-@idaread
+@idasync
 def idb_meta() -> Metadata:
     """Get IDB metadata"""
 
@@ -101,19 +109,19 @@ def idb_meta() -> Metadata:
 
 @test()
 def test_idb_meta():
+    """idb_meta returns valid metadata with all required fields"""
     meta = idb_meta()
-    assert "path" in meta
-    assert "module" in meta
-    assert "base" in meta
-    assert "size" in meta
-    assert "md5" in meta
-    assert "sha256" in meta
-    assert "crc32" in meta
-    assert "filesize" in meta
+    assert_has_keys(
+        meta, "path", "module", "base", "size", "md5", "sha256", "crc32", "filesize"
+    )
+    assert_non_empty(meta["path"])
+    assert_non_empty(meta["module"])
+    assert_valid_address(meta["base"])
+    assert_valid_address(meta["size"])
 
 
 @tool
-@idaread
+@idasync
 def lookup_funcs(
     queries: Annotated[list[str] | str, "Address(es) or name(s)"],
 ) -> list[dict]:
@@ -162,18 +170,113 @@ def lookup_funcs(
     return results
 
 
+@test()
+def test_lookup_funcs_by_address():
+    """lookup_funcs can find function by address"""
+    fn_addr = get_any_function()
+    if not fn_addr:
+        return  # Skip if no functions
+
+    result = lookup_funcs(fn_addr)
+    assert_is_list(result, min_length=1)
+    assert result[0]["fn"] is not None
+    assert result[0]["error"] is None
+    assert_has_keys(result[0]["fn"], "addr", "name", "size")
+
+
+@test()
+def test_lookup_funcs_invalid():
+    """lookup_funcs returns error for invalid address"""
+    # Use an address that's unlikely to be a valid function
+    result = lookup_funcs("0xDEADBEEFDEADBEEF")
+    assert_is_list(result, min_length=1)
+    assert result[0]["fn"] is None
+    assert result[0]["error"] is not None
+
+
+@test()
+def test_lookup_funcs_wildcard():
+    """lookup_funcs with '*' returns all functions (covers lines 132-134)"""
+    result = lookup_funcs("*")
+    assert_is_list(result, min_length=1)
+    # All results should have query="*" and a function
+    for r in result:
+        assert r["query"] == "*"
+        assert r["fn"] is not None
+
+
+@test()
+def test_lookup_funcs_empty():
+    """lookup_funcs with empty string returns all functions (covers lines 132-134)"""
+    result = lookup_funcs("")
+    assert_is_list(result, min_length=1)
+    assert result[0]["query"] == "*"
+
+
+@test()
+def test_lookup_funcs_malformed_hex():
+    """lookup_funcs handles malformed hex address (covers lines 148-149)"""
+    # This looks like an address but isn't valid hex
+    result = lookup_funcs("0xZZZZ")
+    assert_is_list(result, min_length=1)
+    # Should return error since it's not a valid address or name
+    assert result[0]["error"] is not None
+
+
+@test()
+def test_lookup_funcs_data_address():
+    """lookup_funcs with valid address but not a function (covers lines 162-164)"""
+    from .tests import get_data_address
+
+    data_addr = get_data_address()
+    if not data_addr:
+        return  # Skip if no data segments
+
+    result = lookup_funcs(data_addr)
+    assert_is_list(result, min_length=1)
+    # Should return "Not a function" error
+    assert result[0]["fn"] is None
+    assert "Not a function" in str(result[0]["error"]) or "Not found" in str(
+        result[0]["error"]
+    )
+
+
 @tool
-@idaread
+@idasync
 def cursor_addr() -> str:
     """Get current address"""
     return hex(idaapi.get_screen_ea())
 
 
+@test()
+def test_cursor_addr():
+    """cursor_addr returns valid address or handles headless mode"""
+    try:
+        result = cursor_addr()
+        # If it succeeds, verify it's a valid hex address
+        assert_valid_address(result)
+    except IDAError:
+        pass  # Expected in headless mode without GUI
+
+
 @tool
-@idaread
+@idasync
 def cursor_func() -> Optional[Function]:
     """Get current function"""
     return get_function(idaapi.get_screen_ea())
+
+
+@test()
+def test_cursor_func():
+    """cursor_func returns function info or handles headless mode"""
+    try:
+        result = cursor_func()
+        # Result can be None if cursor is not in a function
+        if result is not None:
+            assert_has_keys(result, "addr", "name", "size")
+            assert_valid_address(result["addr"])
+    except IDAError:
+        pass  # Expected in headless mode or if cursor not in function
 
 
 @tool
@@ -245,8 +348,54 @@ def int_convert(
     return results
 
 
+@test()
+def test_int_convert():
+    """int_convert properly converts numbers"""
+    result = int_convert({"text": "0x41"})
+    assert_is_list(result, min_length=1)
+    assert result[0]["error"] is None
+    assert result[0]["result"] is not None
+    conv = result[0]["result"]
+    assert_has_keys(conv, "decimal", "hexadecimal", "bytes", "binary")
+    assert conv["decimal"] == "65"
+    assert conv["hexadecimal"] == "0x41"
+    assert conv["ascii"] == "A"
+
+
+@test()
+def test_int_convert_invalid_text():
+    """int_convert handles invalid number text (covers lines 252-256)"""
+    result = int_convert({"text": "not_a_number"})
+    assert_is_list(result, min_length=1)
+    assert result[0]["result"] is None
+    assert result[0]["error"] is not None
+    assert "Invalid number" in result[0]["error"]
+
+
+@test()
+def test_int_convert_overflow():
+    """int_convert handles overflow with small size (covers lines 269-277)"""
+    # Try to fit a large number into 1 byte
+    result = int_convert({"text": "0xFFFF", "size": 1})
+    assert_is_list(result, min_length=1)
+    assert result[0]["result"] is None
+    assert result[0]["error"] is not None
+    assert "too big" in result[0]["error"]
+
+
+@test()
+def test_int_convert_non_ascii():
+    """int_convert handles non-ASCII bytes (covers lines 283-285)"""
+    # 0x01 is not a printable ASCII character (control char)
+    result = int_convert({"text": "0x01"})
+    assert_is_list(result, min_length=1)
+    assert result[0]["error"] is None
+    # ascii should be None for non-printable bytes
+    assert result[0]["result"]["ascii"] is None
+
+
 @tool
-@idaread
+@idasync
 def list_funcs(
     queries: Annotated[
         list[ListQuery] | ListQuery | str,
@@ -275,8 +424,40 @@ def list_funcs(
     return results
 
 
+@test()
+def test_list_funcs():
+    """list_funcs returns functions with proper structure"""
+    result = list_funcs({})
+    assert_is_list(result, min_length=1)
+    page = result[0]
+    assert_has_keys(page, "data", "next_offset")
+    assert_is_list(page["data"], min_length=1)
+    # Check first function has required keys
+    fn = page["data"][0]
+    assert_has_keys(fn, "addr", "name", "size")
+    assert_valid_address(fn["addr"])
+
+
+@test()
+def test_list_funcs_pagination():
+    """list_funcs pagination works correctly"""
+    # Get first 2 functions
+    result1 = list_funcs({"offset": 0, "count": 2})
+    assert_is_list(result1, min_length=1)
+    page1 = result1[0]
+    assert len(page1["data"]) <= 2
+
+    # Get next 2 functions
+    if page1["next_offset"] is not None:
+        result2 = list_funcs({"offset": page1["next_offset"], "count": 2})
+        page2 = result2[0]
+        # Verify we got different functions (if there are enough)
+        if page2["data"]:
+            assert page1["data"][0]["addr"] != page2["data"][0]["addr"]
+
+
 @tool
-@idaread
+@idasync
 def list_globals(
     queries: Annotated[
         list[ListQuery] | ListQuery | str,
@@ -308,8 +489,40 @@ def list_globals(
     return results
 
 
+@test()
+def test_list_globals():
+    """list_globals returns global variables with proper structure"""
+    result = list_globals({})
+    assert_is_list(result, min_length=1)
+    page = result[0]
+    assert_has_keys(page, "data", "next_offset")
+    # Globals list may be empty for some binaries
+    if page["data"]:
+        glob = page["data"][0]
+        assert_has_keys(glob, "addr", "name")
+        assert_valid_address(glob["addr"])
+
+
+@test()
+def test_list_globals_pagination():
+    """list_globals pagination works correctly"""
+    # Get first 2 globals
+    result1 = list_globals({"offset": 0, "count": 2})
+    assert_is_list(result1, min_length=1)
+    page1 = result1[0]
+    assert len(page1["data"]) <= 2
+
+    # Get next 2 globals if available
+    if page1["next_offset"] is not None and page1["data"]:
+        result2 = list_globals({"offset": page1["next_offset"], "count": 2})
+        page2 = result2[0]
+        # Verify we got different globals (if there are enough)
+        if page2["data"]:
+            assert page1["data"][0]["addr"] != page2["data"][0]["addr"]
+
+
 @tool
-@idaread
+@idasync
 def imports(
     offset: Annotated[int, "Offset"],
     count: Annotated[int, "Count (0=all)"],
@@ -337,8 +550,36 @@ def imports(
     return paginate(rv, offset, count)
 
 
+@test()
+def test_imports():
+    """imports returns list of imported functions"""
+    result = imports(0, 50)
+    assert_has_keys(result, "data", "next_offset")
+    # Imports may be empty for some binaries (static linking)
+    if result["data"]:
+        imp = result["data"][0]
+        assert_has_keys(imp, "addr", "imported_name", "module")
+        assert_valid_address(imp["addr"])
+
+
+@test()
+def test_imports_pagination():
+    """imports pagination works correctly"""
+    # Get first 2 imports
+    result1 = imports(0, 2)
+    assert_has_keys(result1, "data", "next_offset")
+    assert len(result1["data"]) <= 2
+
+    # Get next 2 imports if available
+    if result1["next_offset"] is not None and result1["data"]:
+        result2 = imports(result1["next_offset"], 2)
+        # Verify we got different imports (if there are enough)
+        if result2["data"]:
+            assert result1["data"][0]["addr"] != result2["data"][0]["addr"]
+
+
 @tool
-@idaread
+@idasync
 def strings(
     queries: Annotated[
         list[ListQuery] | ListQuery | str,
@@ -349,9 +590,8 @@ def strings(
     queries = normalize_dict_list(
         queries, lambda s: {"offset": 0, "count": 50, "filter": s}
     )
-    
-    # We remove the cached strings call here to avoid OOM on large binaries
-    # all_strings = _get_cached_strings() 
+    # Use cached strings instead of rebuilding every time
+    all_strings = _get_cached_strings()
 
     results = []
     for query in queries:
@@ -363,97 +603,24 @@ def strings(
         if filter_pattern in ("", "*"):
             filter_pattern = ""
 
-        # Optimization: Use api_analysis._perform_binary_search if pattern is provided
-        if filter_pattern and len(filter_pattern) > 3:
-            try:
-                from .api_analysis import _perform_binary_search
-                # Use binary search to find matches
-                search_results = _perform_binary_search([filter_pattern], count, offset, 60)
-                
-                # Convert to String objects
-                matched_strings = []
-                for res in search_results:
-                    for m_addr_str in res.get("matches", []):
-                        try:
-                            ea = int(m_addr_str, 16)
-                            # Try to get string content
-                            s_content = filter_pattern
-                            s_len = len(filter_pattern)
-                            
-                            # Best effort to get real string content
-                            detected_str_type = ida_nalt.get_str_type(ea)
-                            if detected_str_type:
-                                content = idc.get_strlit_contents(ea, -1, detected_str_type)
-                                if content:
-                                    s_content = content.decode("utf-8", errors="replace")
-                                    s_len = len(content)
-                                    
-                            matched_strings.append(
-                                String(addr=hex(ea), length=s_len, string=s_content)
-                            )
-                        except:
-                            pass
-                            
-                results.append(
-                    Page(
-                        items=matched_strings,
-                        total=len(matched_strings), # Estimated
-                        limit=count,
-                        offset=offset
-                    )
-                )
-                continue
-            except ImportError:
-                pass # Fallback to slow method if import fails
-            except Exception as e:
-                print(f"[MCP] Optimized strings list failed: {e}")
-
-        # Fallback: Iterate using generator (slow but reliable for wildcards)
-        filtered_strings = []
-        
-        # Use generator to avoid building full list
-        try:
-            matched_count = 0
-            skipped_count = 0
-            
-            for s in idautils.Strings():
-                # Apply filter
-                s_str = str(s)
-                if filter_pattern and filter_pattern.lower() not in s_str.lower():
-                    continue
-                    
-                # Pagination logic: skip until offset
-                if skipped_count < offset:
-                    skipped_count += 1
-                    continue
-                    
-                # Add to result
-                filtered_strings.append(
-                    String(addr=hex(s.ea), length=s.length, string=s_str)
-                )
-                matched_count += 1
-                
-                # Stop if we have enough
-                if matched_count >= count:
-                    break
-                    
-                # Safety break for huge lists without filter
-                if not filter_pattern and (matched_count + skipped_count) > 100000:
-                    break
-                    
-        except Exception:
-            pass
-
-        results.append(
-            Page(
-                items=filtered_strings,
-                total=offset + len(filtered_strings) + (1 if len(filtered_strings) == count else 0), # Rough estimate
-                limit=count,
-                offset=offset
-            )
-        )
+        filtered = pattern_filter(all_strings, filter_pattern, "string")
+        results.append(paginate(filtered, offset, count))
 
     return results
+
+
+@test()
+def test_strings():
+    """strings returns string list with proper structure"""
+    result = strings({})
+    assert_is_list(result, min_length=1)
+    page = result[0]
+    assert_has_keys(page, "data", "next_offset")
+    # If there are strings, check structure
+    if page["data"]:
+        string_item = page["data"][0]
+        assert_has_keys(string_item, "addr", "length", "string")
+        assert_valid_address(string_item["addr"])
 
 
 def ida_segment_perm2str(perm: int) -> str:
@@ -474,7 +641,7 @@ def ida_segment_perm2str(perm: int) -> str:
 
 
 @tool
-@idaread
+@idasync
 def segments() -> list[Segment]:
     """List all segments"""
     segments = []
@@ -495,8 +662,19 @@ def segments() -> list[Segment]:
     return segments
 
 
+@test()
+def test_segments():
+    """segments returns list of memory segments"""
+    result = segments()
+    assert_is_list(result, min_length=1)
+    seg = result[0]
+    assert_has_keys(seg, "name", "start", "end", "size", "permissions")
+    assert_valid_address(seg["start"])
+    assert_valid_address(seg["end"])
+
+
 @tool
-@idaread
+@idasync
 def local_types():
     """List local types"""
     error = ida_hexrays.hexrays_failure_t()
@@ -542,3 +720,17 @@ def local_types():
         except Exception:
             continue
     return locals
+
+
+@test()
+def test_local_types():
+    """local_types returns list of local types"""
+    result = local_types()
+    # Result is a list of strings describing local types
+    assert isinstance(result, list), f"Expected list, got {type(result).__name__}"
+    # Local types may be empty for some binaries
+    if result:
+        # Each item should be a string describing a type
+        assert isinstance(result[0], str), (
+            f"Expected string items, got {type(result[0]).__name__}"
+        )

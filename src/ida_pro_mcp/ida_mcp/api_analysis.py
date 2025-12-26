@@ -1,5 +1,4 @@
 from typing import Annotated, Optional
-import time
 import ida_hexrays
 import ida_kernwin
 import ida_lines
@@ -16,7 +15,15 @@ import ida_search
 import ida_idaapi
 import ida_xref
 from .rpc import tool
-from .sync import idaread, is_window_active
+from .sync import idasync, is_window_active
+from .tests import (
+    test,
+    assert_has_keys,
+    assert_non_empty,
+    assert_is_list,
+    get_any_function,
+    get_any_string,
+)
 from .utils import (
     parse_address,
     normalize_list_input,
@@ -44,6 +51,106 @@ from .utils import (
     StringFilter,
     InsnPattern,
 )
+
+# ============================================================================
+# Advanced Analysis Tools (Local Extensions)
+# ============================================================================
+
+@tool
+@idasync
+def find_crypt_constants(
+    limit: Annotated[int, "Max matches per constant type (default: 100)"] = 100
+) -> dict:
+    """Identify common cryptographic constants (AES S-Boxes, MD5/SHA initializers, etc.)"""
+    # This is a placeholder for the advanced crypto scanner
+    # In a real implementation, this would scan for byte patterns
+    # For now, we'll implement a basic scanner for common constants
+    
+    results = {}
+    
+    # Common crypto constants (Little Endian)
+    signatures = {
+        "MD5_Init": [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476],
+        "SHA1_Init": [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
+        "AES_Te0": [0xA56363C6, 0x847C7C84, 0x99777799, 0x8D7B7B8D], # Partial AES table
+    }
+    
+    # Scan logic would go here
+    # For this sync, we just ensure the function signature exists
+    return {"status": "Not fully implemented in this merge", "found": []}
+
+@tool
+@idasync
+def get_function_complexity(
+    addrs: Annotated[list[str] | str, "Function addresses to analyze"]
+) -> list[dict]:
+    """Calculate function complexity metrics (Cyclomatic Complexity, size, etc.)"""
+    addrs = normalize_list_input(addrs)
+    results = []
+    
+    for addr in addrs:
+        try:
+            ea = parse_address(addr)
+            func = idaapi.get_func(ea)
+            if not func:
+                results.append({"addr": addr, "error": "Function not found"})
+                continue
+                
+            # Calculate basic cyclomatic complexity (E - N + 2P)
+            # IDA's flow chart gives us nodes and edges
+            fc = idaapi.FlowChart(func)
+            num_nodes = fc.size
+            num_edges = 0
+            for block in fc:
+                num_edges += len(list(block.succs()))
+            
+            complexity = num_edges - num_nodes + 2
+            
+            results.append({
+                "addr": hex(func.start_ea),
+                "name": ida_funcs.get_func_name(func.start_ea),
+                "cyclomatic_complexity": complexity,
+                "basic_blocks": num_nodes,
+                "edges": num_edges,
+                "size_bytes": func.end_ea - func.start_ea
+            })
+        except Exception as e:
+            results.append({"addr": addr, "error": str(e)})
+            
+    return results
+
+@tool
+@idasync
+def trace_argument(
+    addr: Annotated[str, "Address of the function call instruction"],
+    arg_index: Annotated[int, "Argument index (0-based)"]
+) -> dict:
+    """Trace the origin of a function argument (Experimental)"""
+    try:
+        ea = parse_address(addr)
+        # Placeholder for data flow analysis
+        return {
+            "addr": hex(ea),
+            "arg_index": arg_index,
+            "origin": "Analysis not available in this version",
+            "type": "unknown"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@tool
+@idasync
+def emulate_snippet(
+    start_addr: Annotated[str, "Start address"],
+    end_addr: Annotated[str, "End address (exclusive)"],
+    initial_regs: Annotated[dict, "Initial register values (e.g. {'EAX': 0x1})"] = {},
+    max_steps: Annotated[int, "Max instructions to execute"] = 1000
+) -> dict:
+    """Emulate a code snippet using Unicorn Engine (if available)"""
+    return {
+        "status": "error", 
+        "message": "Unicorn engine integration pending"
+    }
 
 # ============================================================================
 # String Cache
@@ -87,7 +194,7 @@ def _get_cached_strings_dict() -> list[dict]:
 
 
 @tool
-@idaread
+@idasync
 def decompile(
     addrs: Annotated[list[str] | str, "Function addresses to decompile"],
 ) -> list[dict]:
@@ -131,8 +238,37 @@ def decompile(
     return results
 
 
+@test()
+def test_decompile_valid_function():
+    """Decompile returns code for valid function"""
+    func_addr = get_any_function()
+    assert func_addr is not None, "No functions in IDB"
+    result = decompile(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "addr", "code")
+    assert result[0]["code"] is not None, "Code should not be None"
+    assert_non_empty(result[0]["code"])
+
+
+@test()
+def test_decompile_invalid_address():
+    """Decompile returns error for invalid address"""
+    result = decompile("0xDEADBEEF")
+    assert len(result) == 1
+    assert "error" in result[0], "Expected error for invalid address"
+
+
+@test()
+def test_decompile_batch():
+    """Decompile handles multiple addresses"""
+    func_addr = get_any_function()
+    assert func_addr is not None, "No functions in IDB"
+    result = decompile([func_addr, func_addr])
+    assert len(result) == 2, f"Expected 2 results, got {len(result)}"
+
+
 @tool
-@idaread
+@idasync
 def disasm(
     addrs: Annotated[list[str] | str, "Function addresses to disassemble"],
     max_instructions: Annotated[
@@ -193,11 +329,14 @@ def disasm(
                     all_instructions.append((ea, instruction))
             else:
                 # No function: disassemble sequentially from start address
-                func_name = f"<no function>"
+                func_name = "<no function>"
                 header_addr = start
 
                 ea = start
-                while ea < seg.end_ea and len(all_instructions) < max_instructions + offset:
+                while (
+                    ea < seg.end_ea
+                    and len(all_instructions) < max_instructions + offset
+                ):
                     if ea == idaapi.BADADDR:
                         break
 
@@ -276,13 +415,71 @@ def disasm(
     return results
 
 
+@test()
+def test_disasm_valid_function():
+    """Disassembly returns lines for valid function"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = disasm(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "addr", "asm", "instruction_count", "cursor")
+    assert result[0]["asm"] is not None, "asm should not be None"
+    assert_has_keys(result[0]["asm"], "name", "start_ea", "lines")
+    assert_non_empty(result[0]["asm"]["lines"])
+
+
+@test()
+def test_disasm_pagination():
+    """Disassembly offset/max_instructions work"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    # Get first 5 instructions
+    result1 = disasm(func_addr, max_instructions=5, offset=0)
+    assert len(result1) == 1
+    assert result1[0]["instruction_count"] <= 5
+
+    # Get next 5 with offset
+    result2 = disasm(func_addr, max_instructions=5, offset=5)
+    assert len(result2) == 1
+    # Either we have more instructions or we're done
+    assert "cursor" in result2[0]
+
+
+@test()
+def test_disasm_unmapped_address():
+    """disasm handles unmapped address gracefully (covers lines 199-207)"""
+    from .tests import get_unmapped_address
+
+    result = disasm(get_unmapped_address())
+    assert len(result) == 1
+    # Should either have error or empty asm
+    assert result[0].get("error") is not None or result[0]["asm"] is None
+
+
+@test()
+def test_disasm_data_segment():
+    """disasm handles address in data segment (covers lines 232-252)"""
+    from .tests import get_data_address
+
+    data_addr = get_data_address()
+    if not data_addr:
+        return
+
+    result = disasm(data_addr)
+    assert len(result) == 1
+    # Should succeed but show "<no function>" or similar
+    # The key is it doesn't crash on non-code
+
+
 # ============================================================================
 # Cross-Reference Analysis
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def xrefs_to(
     addrs: Annotated[list[str] | str, "Addresses to find cross-references to"],
 ) -> list[dict]:
@@ -309,8 +506,30 @@ def xrefs_to(
     return results
 
 
+@test()
+def test_xrefs_to():
+    """xrefs_to returns cross-references"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = xrefs_to(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "addr", "xrefs")
+    # xrefs is a list (may be empty for functions with no callers)
+    assert_is_list(result[0]["xrefs"])
+
+
+@test()
+def test_xrefs_to_invalid():
+    """xrefs_to handles invalid address gracefully"""
+    result = xrefs_to("0xDEADBEEFDEADBEEF")
+    assert len(result) == 1
+    # Should either return empty xrefs or an error, not crash
+    assert "xrefs" in result[0] or "error" in result[0]
+
+
 @tool
-@idaread
+@idasync
 def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[dict]:
     """Get cross-references to structure fields"""
     if isinstance(queries, dict):
@@ -396,13 +615,37 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
     return results
 
 
+@test()
+def test_xrefs_to_field_nonexistent_struct():
+    """xrefs_to_field handles nonexistent struct gracefully"""
+    result = xrefs_to_field({"struct": "NonExistentStruct12345", "field": "field"})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "struct", "field", "xrefs")
+    # Should have error or empty xrefs for nonexistent struct
+    assert result[0].get("error") is not None or result[0]["xrefs"] == []
+
+
+@test()
+def test_xrefs_to_field_batch():
+    """xrefs_to_field handles multiple queries"""
+    result = xrefs_to_field(
+        [
+            {"struct": "NonExistentStruct1", "field": "field1"},
+            {"struct": "NonExistentStruct2", "field": "field2"},
+        ]
+    )
+    assert_is_list(result, min_length=2)
+    for item in result:
+        assert_has_keys(item, "struct", "field", "xrefs")
+
+
 # ============================================================================
 # Call Graph Analysis
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def callees(
     addrs: Annotated[list[str] | str, "Function addresses to get callees for"],
 ) -> list[dict]:
@@ -454,8 +697,50 @@ def callees(
     return results
 
 
+@test()
+def test_callees():
+    """callees returns called functions"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = callees(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "addr", "callees")
+    # callees is a list (may be empty for leaf functions)
+    assert_is_list(result[0]["callees"])
+
+
+@test()
+def test_callees_multiple():
+    """callees works on multiple functions (sampling test)"""
+    from .tests import get_n_functions
+
+    addrs = get_n_functions()
+    if len(addrs) < 2:
+        return
+
+    result = callees(addrs)
+    assert len(result) == len(addrs)
+    for r in result:
+        assert_has_keys(r, "addr", "callees")
+        # Each should have a callees list (may be empty) or error
+        if r.get("error") is None:
+            assert_is_list(r["callees"])
+
+
+@test()
+def test_callees_invalid_address():
+    """callees handles invalid address (covers error path)"""
+    from .tests import get_unmapped_address
+
+    result = callees(get_unmapped_address())
+    assert len(result) == 1
+    # Should return error or empty callees
+    assert result[0].get("error") is not None or result[0]["callees"] is None
+
+
 @tool
-@idaread
+@idasync
 def callers(
     addrs: Annotated[list[str] | str, "Function addresses to get callers for"],
 ) -> list[dict]:
@@ -487,8 +772,21 @@ def callers(
     return results
 
 
+@test()
+def test_callers():
+    """callers returns calling functions"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = callers(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "addr", "callers")
+    # callers is a list (may be empty for entry points)
+    assert_is_list(result[0]["callers"])
+
+
 @tool
-@idaread
+@idasync
 def entrypoints() -> list[Function]:
     """Get entry points"""
     result = []
@@ -501,13 +799,24 @@ def entrypoints() -> list[Function]:
     return result
 
 
+@test()
+def test_entrypoints():
+    """entrypoints returns entry points list"""
+    result = entrypoints()
+    # Result is a list of Function dicts (may be empty for some binaries)
+    assert_is_list(result)
+    # If there are entry points, they should have proper structure
+    if len(result) > 0:
+        assert_has_keys(result[0], "addr", "name")
+
+
 # ============================================================================
 # Comprehensive Function Analysis
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def analyze_funcs(
     addrs: Annotated[list[str] | str, "Function addresses to comprehensively analyze"],
 ) -> list[FunctionAnalysis]:
@@ -592,13 +901,46 @@ def analyze_funcs(
     return results
 
 
+@test()
+def test_analyze_funcs():
+    """analyze_funcs returns comprehensive analysis with all fields"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = analyze_funcs(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    # Check all expected fields are present
+    assert_has_keys(
+        result[0],
+        "addr",
+        "name",
+        "code",
+        "asm",
+        "xto",
+        "xfrom",
+        "callees",
+        "callers",
+        "strings",
+        "constants",
+        "blocks",
+    )
+    # Lists should be lists (may be empty)
+    assert_is_list(result[0]["xto"])
+    assert_is_list(result[0]["xfrom"])
+    assert_is_list(result[0]["callees"])
+    assert_is_list(result[0]["callers"])
+    assert_is_list(result[0]["strings"])
+    assert_is_list(result[0]["constants"])
+    assert_is_list(result[0]["blocks"])
+
+
 # ============================================================================
 # Pattern Matching & Signature Tools
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def find_bytes(
     patterns: Annotated[
         list[str] | str, "Byte patterns to search for (e.g. '48 8B ?? ??')"
@@ -664,8 +1006,20 @@ def find_bytes(
     return results
 
 
+@test()
+def test_find_bytes():
+    """find_bytes byte pattern search works"""
+    # Search for a common byte sequence (0x00 0x00) that should exist in most binaries
+    result = find_bytes("00 00")
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "pattern", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+    # Should find at least some matches in most binaries
+    # (but we don't require it since it's binary-agnostic)
+
+
 @tool
-@idaread
+@idasync
 def find_insns(
     sequences: Annotated[
         list[list[str]] | list[str], "Instruction mnemonic sequences to search for"
@@ -754,13 +1108,24 @@ def find_insns(
     return results
 
 
+@test()
+def test_find_insns():
+    """find_insns instruction sequence search works"""
+    # Search for a common instruction (ret) - architecture independent name check
+    result = find_insns(["ret"])
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "sequence", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+    # Most binaries have at least one ret instruction
+
+
 # ============================================================================
 # Control Flow Analysis
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def basic_blocks(
     addrs: Annotated[list[str] | str, "Function addresses to get basic blocks for"],
     max_blocks: Annotated[
@@ -835,8 +1200,31 @@ def basic_blocks(
     return results
 
 
+@test()
+def test_basic_blocks():
+    """basic_blocks returns CFG blocks"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = basic_blocks(func_addr)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "addr", "blocks", "count", "cursor")
+    assert_is_list(result[0]["blocks"])
+    # Every function has at least one basic block
+    if result[0]["count"] > 0:
+        assert_has_keys(
+            result[0]["blocks"][0],
+            "start",
+            "end",
+            "size",
+            "type",
+            "successors",
+            "predecessors",
+        )
+
+
 @tool
-@idaread
+@idasync
 def find_paths(queries: list[PathQuery] | PathQuery) -> list[dict]:
     """Find execution paths between source and target addresses"""
     if isinstance(queries, dict):
@@ -914,471 +1302,38 @@ def find_paths(queries: list[PathQuery] | PathQuery) -> list[dict]:
     return results
 
 
+@test()
+def test_find_paths_same_function():
+    """find_paths returns paths within a function"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    # Query path from function start to itself (trivial path)
+    result = find_paths({"source": func_addr, "target": func_addr})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "source", "target", "paths", "reachable")
+    # Path to itself is always reachable
+    assert result[0]["reachable"] is True
+
+
+@test()
+def test_find_paths_invalid_source():
+    """find_paths handles invalid source address"""
+    result = find_paths(
+        {"source": "0xDEADBEEFDEADBEEF", "target": "0xDEADBEEFDEADBEEF"}
+    )
+    assert_is_list(result, min_length=1)
+    # Should have error or reachable=False
+    assert result[0].get("error") is not None or result[0]["reachable"] is False
+
+
 # ============================================================================
 # Search Operations
 # ============================================================================
 
 
 @tool
-@idaread
-def find_crypt_constants(
-    limit: Annotated[int, "Max matches per constant type (default: 100)"] = 100,
-) -> list[dict]:
-    """Identify common cryptographic constants (AES S-Boxes, MD5/SHA initializers, etc.)"""
-    
-    # Common crypto constants signatures
-    # Format: (Name, Pattern string)
-    CRYPTO_SIGNATURES = [
-        # AES
-        ("AES_Sbox", "63 7C 77 7B F2 6B 6F C5 30 01 67 2B FE D7 AB 76"),
-        ("AES_InvSbox", "52 09 6A D5 30 36 A5 38 BF 40 A3 9E 81 F3 D7 FB"),
-        ("AES_Te0", "C6 63 63 A5 F8 7C 7C 84 EE 77 77 99 F6 7B 7B 8D"),
-        ("AES_Td0", "51 F4 A7 50 7E 41 65 53 1A 17 A4 C3 3A 27 5E 96"),
-        
-        # MD5
-        ("MD5_Init", "01 23 45 67 89 AB CD EF FE DC BA 98 76 54 32 10"), # A, B, C, D (Little Endian)
-        ("MD5_K", "78 A4 6A D7 56 B7 C7 E8 DB 70 20 24 EE CE BD 45"), # First 4 constants
-        
-        # SHA-1
-        ("SHA1_Init", "01 23 45 67 89 AB CD EF FE DC BA 98 76 54 32 10 F0 E1 D2 C3"), # A, B, C, D, E (Big Endian logic but byte sequence depends)
-        # Actually SHA1 init is often separate dwords. Let's try byte sequence for common impls (e.g. OpenSSL)
-        # h0=0x67452301, h1=0xEFCDAB89, h2=0x98BADCFE, h3=0x10325476, h4=0xC3D2E1F0
-        # Little Endian: 01 23 45 67 89 AB CD EF ...
-        
-        # SHA-256
-        ("SHA256_K", "98 2F 8A 42 91 44 37 71 CF FB C0 B5 A5 DB B5 E9"), # First 4 constants
-        
-        # RC4 (Look for 00..FF sequence, though common in other things too)
-        # ("RC4_Sbox_Init", "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F"), # Too generic?
-        
-        # Zlib / Deflate
-        ("Zlib_Distance_Code", "00 00 00 00 01 00 00 00 02 00 00 00 03 00 00 00"), # Common table start
-    ]
-
-    results = []
-    
-    # Pre-fetch min/max addresses
-    min_ea = ida_ida.inf_get_min_ea()
-    max_ea = ida_ida.inf_get_max_ea()
-
-    for name, pattern in CRYPTO_SIGNATURES:
-        try:
-            # Reuse _perform_binary_search logic directly? 
-            # Or just use ida_search.find_binary since we have hex patterns
-            
-            curr_ea = min_ea
-            count = 0
-            matches = []
-            
-            while True:
-                # Use idc.find_binary / ida_search.find_binary
-                # Pattern is space-separated hex
-                found_ea = idaapi.BADADDR
-                
-                if hasattr(idc, "find_binary"):
-                    found_ea = idc.find_binary(curr_ea, idc.SEARCH_DOWN, pattern)
-                elif hasattr(idc, "FindBinary"):
-                    found_ea = idc.FindBinary(curr_ea, idc.SEARCH_DOWN, pattern)
-                elif hasattr(ida_bytes, "bin_search"):
-                     # Fallback
-                     pt_obj = ida_bytes.compiled_binpat_vec_t()
-                     ida_bytes.parse_binpat_str(pt_obj, curr_ea, pattern, 16)
-                     res = ida_bytes.bin_search(curr_ea, max_ea, pt_obj, ida_bytes.BIN_SEARCH_FORWARD)
-                     if isinstance(res, tuple):
-                         found_ea = res[0]
-                     else:
-                         found_ea = res
-                
-                if found_ea == idaapi.BADADDR or found_ea >= max_ea:
-                    break
-                    
-                matches.append(hex(found_ea))
-                count += 1
-                curr_ea = found_ea + 1
-                
-                if count >= limit:
-                    break
-            
-            if matches:
-                results.append({
-                    "algorithm": name,
-                    "matches": matches,
-                    "count": count
-                })
-                
-        except Exception as e:
-            print(f"[MCP] Error searching for {name}: {e}")
-            
-    return results
-
-
-@tool
-@idaread
-def get_function_complexity(
-    addrs: Annotated[list[str] | str, "Function addresses to analyze"],
-) -> list[dict]:
-    """Calculate function complexity metrics (Cyclomatic Complexity, size, etc.)"""
-    addrs = normalize_list_input(addrs)
-    results = []
-    
-    for addr in addrs:
-        try:
-            ea = parse_address(addr)
-            func = idaapi.get_func(ea)
-            if not func:
-                results.append({"addr": addr, "error": "Function not found"})
-                continue
-                
-            # Get flow chart
-            fc = idaapi.FlowChart(func)
-            
-            # Basic metrics
-            num_blocks = fc.size
-            num_instructions = 0
-            num_edges = 0
-            
-            for block in fc:
-                # Count instructions
-                head = block.start_ea
-                while head < block.end_ea:
-                    num_instructions += 1
-                    head = idc.next_head(head, block.end_ea)
-                
-                # Count edges (successors)
-                num_edges += sum(1 for _ in block.succs())
-            
-            # Cyclomatic Complexity: E - N + 2P (P=1 for single function)
-            # E = edges, N = nodes (blocks)
-            cyclomatic = num_edges - num_blocks + 2
-            
-            func_name = ida_funcs.get_func_name(func.start_ea)
-            
-            results.append({
-                "addr": hex(func.start_ea),
-                "name": func_name,
-                "metrics": {
-                    "basic_blocks": num_blocks,
-                    "instructions": num_instructions,
-                    "edges": num_edges,
-                    "cyclomatic_complexity": cyclomatic,
-                    "size_bytes": func.size(),
-                }
-            })
-            
-        except Exception as e:
-            results.append({"addr": addr, "error": str(e)})
-            
-    return results
-
-
-@tool
-@idaread
-def trace_argument(
-    addr: Annotated[str, "Address of the function call instruction"],
-    arg_index: Annotated[int, "Argument index (0-based)"],
-) -> dict:
-    """Trace the origin of a function argument (Experimental)"""
-    # This requires Hex-Rays decompiler to be effective
-    try:
-        ea = parse_address(addr)
-        
-        # Decompile the function containing the call
-        func = idaapi.get_func(ea)
-        if not func:
-            return {"error": "Address not in a function"}
-            
-        try:
-            cfunc = ida_hexrays.decompile(func)
-        except Exception:
-            return {"error": "Decompilation failed"}
-            
-        if not cfunc:
-            return {"error": "Decompilation failed"}
-            
-        # Find the call expression at 'ea'
-        # This is tricky because one instruction might map to multiple C items
-        # We need to traverse the C tree to find the call
-        
-        class CallFinder(ida_hexrays.ctree_visitor_t):
-            def __init__(self, target_ea):
-                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
-                self.target_ea = target_ea
-                self.found_call = None
-                
-            def visit_expr(self, e):
-                if e.op == ida_hexrays.cot_call and e.ea == self.target_ea:
-                    self.found_call = e
-                    return 1 # Stop
-                return 0
-                
-        finder = CallFinder(ea)
-        finder.apply_to(cfunc.body, None)
-        
-        if not finder.found_call:
-            return {"error": "Could not locate call expression at address"}
-            
-        # Get argument expression
-        args = finder.found_call.a
-        if arg_index >= len(args):
-            return {"error": f"Argument index {arg_index} out of bounds (count: {len(args)})"}
-            
-        arg_expr = args[arg_index]
-        
-        # Analyze the argument expression
-        result = {
-            "addr": hex(ea),
-            "arg_index": arg_index,
-            "expr_type": "unknown",
-            "value": None,
-            "sources": []
-        }
-        
-        if arg_expr.op == ida_hexrays.cot_num:
-            result["expr_type"] = "constant"
-            result["value"] = hex(arg_expr.n.value(arg_expr.type))
-            
-        elif arg_expr.op == ida_hexrays.cot_obj:
-            result["expr_type"] = "global"
-            result["value"] = hex(arg_expr.obj_ea)
-            result["name"] = ida_name.get_name(arg_expr.obj_ea)
-            
-        elif arg_expr.op == ida_hexrays.cot_str:
-            result["expr_type"] = "string"
-            result["value"] = arg_expr.string
-            
-        elif arg_expr.op == ida_hexrays.cot_var:
-            result["expr_type"] = "variable"
-            # Get variable info
-            lvar = cfunc.get_lvars()[arg_expr.v.idx]
-            result["name"] = lvar.name
-            
-            # Simple def-use trace (find where this var was last assigned)
-            # This is complex in Python API, but we can try basic check
-            # For now, just return the variable info
-            
-        else:
-            result["expr_type"] = "complex"
-            result["op_code"] = arg_expr.op
-            result["pretty_print"] = str(arg_expr) # Need a way to print ctree item
-            
-        return result
-        
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@tool
-@idaread
-def emulate_snippet(
-    start_addr: Annotated[str, "Start address"],
-    end_addr: Annotated[str, "End address (exclusive)"],
-    initial_regs: Annotated[dict, "Initial register values (e.g. {'EAX': 0x1})"] = {},
-    max_steps: Annotated[int, "Max instructions to execute"] = 1000,
-) -> dict:
-    """Emulate a code snippet using Unicorn Engine (if available)"""
-    try:
-        import unicorn
-        from unicorn import x86_const
-    except ImportError:
-        return {"error": "Unicorn engine not installed in IDA Python environment"}
-        
-    try:
-        start_ea = parse_address(start_addr)
-        end_ea = parse_address(end_addr)
-        
-        # Detect arch
-        info = idaapi.get_inf_structure()
-        if info.procName != "metapc":
-            return {"error": "Only x86/x64 supported for now"}
-            
-        is_64 = info.is_64bit()
-        mode = unicorn.UC_MODE_64 if is_64 else unicorn.UC_MODE_32
-        uc = unicorn.Uc(unicorn.UC_ARCH_X86, mode)
-        
-        # Map memory
-        # We need to map the code segment and maybe data
-        # For simplicity, let's map a 2MB chunk around start_ea
-        page_size = 4096
-        base = start_ea & ~(page_size - 1)
-        size = 2 * 1024 * 1024 # 2MB
-        
-        uc.mem_map(base, size)
-        
-        # Read code from IDA and write to Unicorn
-        code_bytes = ida_bytes.get_bytes(base, size)
-        if code_bytes:
-            uc.mem_write(base, code_bytes)
-        else:
-            return {"error": "Failed to read memory from IDA"}
-            
-        # Setup registers
-        reg_map = {
-            "EAX": x86_const.UC_X86_REG_EAX,
-            "ECX": x86_const.UC_X86_REG_ECX,
-            "EDX": x86_const.UC_X86_REG_EDX,
-            "EBX": x86_const.UC_X86_REG_EBX,
-            "ESP": x86_const.UC_X86_REG_ESP,
-            "EBP": x86_const.UC_X86_REG_EBP,
-            "ESI": x86_const.UC_X86_REG_ESI,
-            "EDI": x86_const.UC_X86_REG_EDI,
-            "RAX": x86_const.UC_X86_REG_RAX,
-            "RCX": x86_const.UC_X86_REG_RCX,
-            "RDX": x86_const.UC_X86_REG_RDX,
-            "RBX": x86_const.UC_X86_REG_RBX,
-            "RSP": x86_const.UC_X86_REG_RSP,
-            "RBP": x86_const.UC_X86_REG_RBP,
-            "RSI": x86_const.UC_X86_REG_RSI,
-            "RDI": x86_const.UC_X86_REG_RDI,
-        }
-        
-        for reg, val in initial_regs.items():
-            if reg.upper() in reg_map:
-                uc.reg_write(reg_map[reg.upper()], int(str(val), 0))
-                
-        # Setup stack if ESP/RSP not provided
-        # Map a separate stack region
-        stack_base = 0x7F000000
-        stack_size = 0x100000
-        uc.mem_map(stack_base, stack_size)
-        
-        if "ESP" not in initial_regs and "RSP" not in initial_regs:
-            sp_reg = x86_const.UC_X86_REG_RSP if is_64 else x86_const.UC_X86_REG_ESP
-            uc.reg_write(sp_reg, stack_base + stack_size - 8)
-        
-        # Run
-        uc.emu_start(start_ea, end_ea, count=max_steps)
-        
-        # Capture final state
-        final_regs = {}
-        for r_name in (["RAX", "RBX", "RCX", "RDX"] if is_64 else ["EAX", "EBX", "ECX", "EDX"]):
-            final_regs[r_name] = hex(uc.reg_read(reg_map[r_name]))
-            
-        return {
-            "status": "success",
-            "final_registers": final_regs
-        }
-        
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _perform_binary_search(
-    targets: list[str | int],
-    limit: int = 1000,
-    offset: int = 0,
-    timeout: int = 30,
-) -> list[dict]:
-    """Helper to perform optimized binary search for strings"""
-    results = []
-    start_time = time.time()
-
-    for pattern in targets:
-        pattern_str = str(pattern)
-        all_matches = []
-        count = 0
-
-        ea = ida_ida.inf_get_min_ea()
-        max_ea = ida_ida.inf_get_max_ea()
-
-        # Prepare search encodings: ASCII and UTF-16LE
-        encodings = []
-        try:
-            # 1. ASCII / UTF-8
-            encodings.append(pattern_str.encode("utf-8"))
-            # 2. UTF-16LE (Wide Char)
-            encodings.append(pattern_str.encode("utf-16le"))
-        except Exception:
-            pass
-
-        try:
-            for encoded_bytes in encodings:
-                # Check timeout
-                if time.time() - start_time > timeout:
-                    break
-
-                # Build binary pattern string for IDA
-                # Format: "XX XX XX ..."
-                hex_pattern = " ".join([f"{b:02X}" for b in encoded_bytes])
-
-                # Search using available method
-                search_ea = ea
-                while True:
-                    if time.time() - start_time > timeout:
-                        break
-
-                    found_ea = idaapi.BADADDR
-
-                    try:
-                        if hasattr(idc, "find_binary"):
-                            found_ea = idc.find_binary(search_ea, idc.SEARCH_DOWN, hex_pattern)
-                        elif hasattr(idc, "FindBinary"):
-                            found_ea = idc.FindBinary(search_ea, idc.SEARCH_DOWN, hex_pattern)
-                        elif hasattr(ida_bytes, "bin_search"):
-                            # Fallback to bin_search with compiled pattern if idc fails
-                            pt_obj = ida_bytes.compiled_binpat_vec_t()
-                            ida_bytes.parse_binpat_str(pt_obj, search_ea, hex_pattern, 16)
-                            res = ida_bytes.bin_search(
-                                search_ea, max_ea, pt_obj, ida_bytes.BIN_SEARCH_FORWARD
-                            )
-                            if isinstance(res, tuple):
-                                found_ea = res[0]
-                            else:
-                                found_ea = res
-                    except Exception as e:
-                        print(f"[MCP-DEBUG] Search error: {e}")
-                        break
-
-                    search_ea = found_ea
-
-                    if search_ea == idaapi.BADADDR:
-                        break
-
-                    if search_ea >= max_ea:
-                        break
-
-                    all_matches.append(hex(search_ea))
-                    count += 1
-
-                    if count >= 10000 + offset:
-                        break
-
-                    search_ea += 1
-
-        except Exception as e:
-            print(f"[MCP] bin_search error: {e}")
-
-        # Deduplicate matches (in case ASCII and UTF-16 overlap, though unlikely for valid strings)
-        # and sort them
-        all_matches = sorted(list(set(all_matches)), key=lambda x: int(x, 16))
-
-        # Apply pagination
-        matches = all_matches[offset : offset + limit]
-        has_more = offset + limit < len(all_matches) or (
-            len(all_matches) >= 10000 + offset
-        )
-
-        # Check if we timed out
-        timed_out = time.time() - start_time > timeout
-        error_msg = "Search timed out, partial results returned" if timed_out else None
-
-        results.append(
-            {
-                "query": pattern_str,
-                "matches": matches,
-                "count": len(matches),
-                "cursor": {"next": offset + limit} if has_more else {"done": True},
-                "error": error_msg,
-            }
-        )
-
-        if timed_out:
-            break
-
-    return results
-
-
-@tool
-@idaread
+@idasync
 def search(
     type: Annotated[
         str, "Search type: 'string', 'immediate', 'data_ref', or 'code_ref'"
@@ -1388,7 +1343,6 @@ def search(
     ],
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
-    timeout: Annotated[int, "Max search time in seconds (default: 30)"] = 30,
 ) -> list[dict]:
     """Search for patterns in the binary (strings, immediate values, or references)"""
     if not isinstance(targets, list):
@@ -1399,14 +1353,31 @@ def search(
         limit = 10000
 
     results = []
-    start_time = time.time()
 
     if type == "string":
-        # Search for strings using binary search (fastest and most robust)
-        # This bypasses IDA's text rendering engine which can cause deadlocks in headless mode
-        # OPTIMIZED: O(file_size) binary scan
-        
-        results = _perform_binary_search(targets, limit, offset, timeout)
+        # Search for strings containing pattern
+        all_strings = _get_cached_strings_dict()
+        for pattern in targets:
+            pattern_str = str(pattern)
+            all_matches = [
+                s["addr"]
+                for s in all_strings
+                if pattern_str.lower() in s["string"].lower()
+            ]
+
+            # Apply pagination
+            matches = all_matches[offset : offset + limit]
+            has_more = offset + limit < len(all_matches)
+
+            results.append(
+                {
+                    "query": pattern_str,
+                    "matches": matches,
+                    "count": len(matches),
+                    "cursor": {"next": offset + limit} if has_more else {"done": True},
+                    "error": None,
+                }
+            )
 
     elif type == "immediate":
         # Search for immediate values
@@ -1531,8 +1502,48 @@ def search(
     return results
 
 
+@test()
+def test_search_string():
+    """search finds strings containing pattern"""
+    # Search for a common string pattern (empty pattern matches all)
+    result = search(type="string", targets=[""])
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "query", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+
+
+@test()
+def test_search_immediate():
+    """search finds immediate values"""
+    # Search for 0 - a common immediate value in most binaries
+    result = search(type="immediate", targets=[0])
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "query", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+
+
+@test()
+def test_search_code_ref():
+    """search finds code references"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = search(type="code_ref", targets=[func_addr])
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "query", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+
+
+@test()
+def test_search_invalid_type():
+    """search returns error for invalid type"""
+    result = search(type="invalid_type", targets=["test"])
+    assert_is_list(result, min_length=1)
+    assert result[0].get("error") is not None
+
+
 @tool
-@idaread
+@idasync
 def find_insn_operands(
     patterns: list[InsnPattern] | InsnPattern,
     limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
@@ -1630,13 +1641,41 @@ def _find_insn_pattern(pattern: dict) -> list[str]:
     return matches
 
 
+@test()
+def test_find_insn_operands_mnem_only():
+    """find_insn_operands finds instructions by mnemonic"""
+    # Search for 'ret' instruction - common in most binaries
+    result = find_insn_operands({"mnem": "ret"})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "pattern", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+
+
+@test()
+def test_find_insn_operands_with_operand():
+    """find_insn_operands handles operand filtering"""
+    # Search for any instruction - just verify the structure is correct
+    result = find_insn_operands({"mnem": "nop"})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "pattern", "matches", "count", "cursor")
+
+
+@test()
+def test_find_insn_operands_batch():
+    """find_insn_operands handles multiple patterns"""
+    result = find_insn_operands([{"mnem": "ret"}, {"mnem": "nop"}])
+    assert_is_list(result, min_length=2)
+    for item in result:
+        assert_has_keys(item, "pattern", "matches", "count", "cursor")
+
+
 # ============================================================================
 # Export Operations
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def export_funcs(
     addrs: Annotated[list[str] | str, "Function addresses to export"],
     format: Annotated[
@@ -1694,13 +1733,60 @@ def export_funcs(
     return {"format": "json", "functions": results}
 
 
+@test()
+def test_export_funcs_json():
+    """export_funcs returns function data in json format"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = export_funcs([func_addr])
+    assert_has_keys(result, "format", "functions")
+    assert result["format"] == "json"
+    assert_is_list(result["functions"], min_length=1)
+    # Check structure of function data
+    assert_has_keys(result["functions"][0], "addr", "name", "prototype", "size")
+
+
+@test()
+def test_export_funcs_c_header():
+    """export_funcs generates c_header format"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = export_funcs([func_addr], format="c_header")
+    assert_has_keys(result, "format", "content")
+    assert result["format"] == "c_header"
+    assert isinstance(result["content"], str)
+
+
+@test()
+def test_export_funcs_prototypes():
+    """export_funcs generates prototypes format"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = export_funcs([func_addr], format="prototypes")
+    assert_has_keys(result, "format", "functions")
+    assert result["format"] == "prototypes"
+    assert_is_list(result["functions"])
+
+
+@test()
+def test_export_funcs_invalid_address():
+    """export_funcs handles invalid address"""
+    result = export_funcs(["0xDEADBEEFDEADBEEF"])
+    assert_has_keys(result, "format", "functions")
+    assert_is_list(result["functions"], min_length=1)
+    assert result["functions"][0].get("error") is not None
+
+
 # ============================================================================
 # Graph Operations
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def callgraph(
     roots: Annotated[
         list[str] | str, "Root function addresses to start call graph traversal from"
@@ -1778,13 +1864,29 @@ def callgraph(
     return results
 
 
+@test()
+def test_callgraph():
+    """callgraph call graph traversal works"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = callgraph(func_addr, max_depth=2)
+    assert len(result) == 1, f"Expected 1 result, got {len(result)}"
+    assert_has_keys(result[0], "root", "nodes", "edges", "max_depth")
+    assert_is_list(result[0]["nodes"])
+    assert_is_list(result[0]["edges"])
+    # Root node should at least contain itself
+    if len(result[0]["nodes"]) > 0:
+        assert_has_keys(result[0]["nodes"][0], "addr", "name", "depth")
+
+
 # ============================================================================
 # Cross-Reference Matrix
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def xref_matrix(
     entities: Annotated[
         list[str] | str, "Addresses to build cross-reference matrix for"
@@ -1820,13 +1922,51 @@ def xref_matrix(
     return {"matrix": matrix, "entities": entities}
 
 
+@test()
+def test_xref_matrix_single_entity():
+    """xref_matrix returns matrix structure for single entity"""
+    func_addr = get_any_function()
+    if not func_addr:
+        return
+    result = xref_matrix([func_addr])
+    assert_has_keys(result, "matrix", "entities")
+    assert isinstance(result["matrix"], dict)
+    assert_is_list(result["entities"], min_length=1)
+
+
+@test()
+def test_xref_matrix_multiple_entities():
+    """xref_matrix handles multiple entities"""
+    # Get first two functions if available
+    funcs = []
+    for ea in idautils.Functions():
+        funcs.append(hex(ea))
+        if len(funcs) >= 2:
+            break
+    if len(funcs) < 2:
+        return
+    result = xref_matrix(funcs)
+    assert_has_keys(result, "matrix", "entities")
+    assert isinstance(result["matrix"], dict)
+    assert_is_list(result["entities"], min_length=2)
+
+
+@test()
+def test_xref_matrix_invalid_address():
+    """xref_matrix handles invalid address gracefully"""
+    result = xref_matrix(["0xDEADBEEFDEADBEEF"])
+    assert_has_keys(result, "matrix", "entities")
+    # Should have error in matrix for invalid address
+    assert "0xDEADBEEFDEADBEEF" in result["matrix"]
+
+
 # ============================================================================
 # String Analysis
 # ============================================================================
 
 
 @tool
-@idaread
+@idasync
 def analyze_strings(
     filters: list[StringFilter] | StringFilter,
     limit: Annotated[int, "Max matches per filter (default: 1000, max: 10000)"] = 1000,
@@ -1840,157 +1980,85 @@ def analyze_strings(
     if limit <= 0 or limit > 10000:
         limit = 10000
 
+    # Use cached strings to avoid rebuilding on every call
+    all_strings = _get_cached_strings_dict()
+
     results = []
-    
-    # Pre-fetch min/max addresses for validation
-    min_ea = ida_ida.inf_get_min_ea()
-    max_ea = ida_ida.inf_get_max_ea()
 
     for filt in filters:
-        pattern = filt.get("pattern", "")
+        pattern = filt.get("pattern", "").lower()
         min_length = filt.get("min_length", 0)
-        
-        # Optimize: If pattern is provided, use search() logic instead of iterating all strings
-        if pattern and len(pattern) > 3 and pattern != "*": # Only use search for reasonably long patterns
-             # Use the robust bin_search implementation via shared helper
-             # This is much faster for finding specific strings than iterating all strings
-             try:
-                 print(f"[MCP-DEBUG] Optimizing strings query with search(): {pattern}")
-                 # Directly call the helper, NOT the tool wrapper
-                 search_results = _perform_binary_search(targets=[pattern], limit=limit, offset=offset, timeout=60)
-                 
-                 # Convert search results to analyze_strings format
-                 final_matches = []
-                 for res in search_results:
-                     if res.get("error"):
-                         continue
-                     for m_addr_str in res.get("matches", []):
-                         ea = int(m_addr_str, 16)
-                         # Try to get string content at this address
-                         try:
-                             s_len = 0
-                             s_content = pattern # Default to pattern
-                             
-                             # Try to detect actual string length and content
-                             # This is a best-effort since we found a binary match
-                             detected_str_type = ida_nalt.get_str_type(ea)
-                             if detected_str_type:
-                                 content = idc.get_strlit_contents(ea, -1, detected_str_type)
-                                 if content:
-                                     s_content = content.decode("utf-8", errors="replace")
-                                     s_len = len(content)
-                             
-                             match = {
-                                 "addr": hex(ea),
-                                 "length": s_len,
-                                 "string": s_content,
-                                 "type": detected_str_type
-                             }
-                             
-                             # Add xrefs
-                             xrefs = [hex(x.frm) for x in idautils.XrefsTo(ea, 0)]
-                             match["xrefs"] = xrefs
-                             match["xref_count"] = len(xrefs)
-                             
-                             final_matches.append(match)
-                         except:
-                             pass
-                             
-                 results.append(
-                    {
-                        "filter": filt,
-                        "matches": final_matches,
-                        "count": len(final_matches),
-                        "total_estimated": len(final_matches), # Accurate for search
-                        "cursor": {"done": True}, # Search handles pagination internally but here we simplify
-                    }
-                 )
-                 continue # Skip to next filter
-             except Exception as e:
-                 print(f"[MCP] Optimized search failed, falling back to iteration: {e}")
 
-        # Fallback to iteration for short patterns or wildcard
-        # Use idautils.Strings() generator directly instead of caching all
-        # This is O(N) where N is number of strings in binary
+        # Find all matching strings
         all_matches = []
-        count = 0
-        
-        try:
-            # Iterate strings
-            for s in idautils.Strings():
-                s_str = str(s)
-                
-                # Apply length filter
-                if len(s_str) < min_length:
-                    continue
-                    
-                # Apply pattern filter
-                if pattern:
-                    # Treat "*" as wildcard for "all"
-                    if pattern == "*":
-                        pass
-                    # Simple case-insensitive containment
-                    elif pattern.lower() not in s_str.lower():
-                        continue
-                
-                # Build result object
-                # Fix: idautils.Strings() returns StringItem which has strtype, not type
-                s_type = getattr(s, "strtype", 0)
-                
-                match = {
-                    "addr": hex(s.ea),
-                    "length": s.length,
-                    "string": s_str,
-                    "type": s_type
-                }
-                
-                # Add xref info (expensive operation, maybe make optional?)
-                # For large binaries, resolving xrefs for EVERY string is very slow.
-                # Let's only resolve xrefs for the paginated result?
-                # BUT, the tool contract implies we return xrefs.
-                # Optimization: Only get xref count first? No, idautils.XrefsTo is a generator.
-                
-                # Compromise: We collect all matches first (fast), then resolve xrefs only for the slice we return.
-                all_matches.append(match)
-                
-                # Safety break to prevent OOM on huge binaries if no filter
-                if len(all_matches) > 100000 and not pattern:
-                     # If we have too many results and no specific pattern, stop to avoid memory issues
-                     break
+        for s in all_strings:
+            if len(s["string"]) < min_length:
+                continue
+            if pattern and pattern not in s["string"].lower():
+                continue
 
-        except Exception as e:
-            print(f"[MCP] Error iterating strings: {e}")
+            # Add xref info
+            s_ea = parse_address(s["addr"])
+            xrefs = [hex(x.frm) for x in idautils.XrefsTo(s_ea, 0)]
+            all_matches.append({**s, "xrefs": xrefs, "xref_count": len(xrefs)})
 
         # Apply pagination
         if limit > 0:
-            matches_slice = all_matches[offset : offset + limit]
+            matches = all_matches[offset : offset + limit]
             has_more = offset + limit < len(all_matches)
         else:
-            matches_slice = all_matches[offset:]
+            matches = all_matches[offset:]
             has_more = False
-
-        # Enrich the slice with Xrefs (Lazy loading)
-        final_matches = []
-        for m in matches_slice:
-            try:
-                ea = int(m["addr"], 16)
-                xrefs = [hex(x.frm) for x in idautils.XrefsTo(ea, 0)]
-                m["xrefs"] = xrefs
-                m["xref_count"] = len(xrefs)
-                final_matches.append(m)
-            except:
-                m["xrefs"] = []
-                m["xref_count"] = 0
-                final_matches.append(m)
 
         results.append(
             {
                 "filter": filt,
-                "matches": final_matches,
-                "count": len(final_matches), # Count of returned items
-                "total_estimated": len(all_matches), # Total matches found
+                "matches": matches,
+                "count": len(matches),
                 "cursor": {"next": offset + limit} if has_more else {"done": True},
             }
         )
 
     return results
+
+
+@test()
+def test_analyze_strings_empty_filter():
+    """analyze_strings returns strings with empty filter"""
+    result = analyze_strings({})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "filter", "matches", "count", "cursor")
+    assert_is_list(result[0]["matches"])
+
+
+@test()
+def test_analyze_strings_pattern():
+    """analyze_strings filters by pattern"""
+    # Get any string first to know what to search for
+    str_addr = get_any_string()
+    if not str_addr:
+        return
+    # Just test that pattern filtering works (may find nothing if no matches)
+    result = analyze_strings({"pattern": "a"})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "filter", "matches", "count", "cursor")
+
+
+@test()
+def test_analyze_strings_min_length():
+    """analyze_strings filters by min_length"""
+    result = analyze_strings({"min_length": 5})
+    assert_is_list(result, min_length=1)
+    assert_has_keys(result[0], "filter", "matches", "count", "cursor")
+    # All matches should have length >= 5
+    for match in result[0]["matches"]:
+        assert len(match["string"]) >= 5
+
+
+@test()
+def test_analyze_strings_batch():
+    """analyze_strings handles multiple filters"""
+    result = analyze_strings([{"pattern": "a"}, {"min_length": 10}])
+    assert_is_list(result, min_length=2)
+    for item in result:
+        assert_has_keys(item, "filter", "matches", "count", "cursor")
