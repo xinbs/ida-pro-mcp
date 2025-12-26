@@ -145,6 +145,38 @@ uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
 
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
+## Web Manager
+
+A web-based interface is available to easily manage headless IDA instances, upload samples, and monitor analysis logs.
+
+### Prerequisites
+
+Ensure you have set the `IDADIR` environment variable to your IDA Pro installation path, or configure it in `web_manager/config.json`.
+
+```json
+{
+    "ida_path": "C:\\Program Files\\IDA Professional 9.2"
+}
+```
+
+### Starting the Web Manager
+
+Run the following command to start the web server:
+
+```sh
+python web_manager/main.py
+```
+
+Access the dashboard at `http://localhost:8001`.
+
+### Features
+
+- **Sample Management**: Upload binaries (supports auto-renaming and sanitization) and delete old samples.
+- **One-Click Analysis**: Start a headless IDA MCP server for any uploaded sample.
+- **Real-time Logs**: Monitor IDA's output and MCP server logs via WebSocket.
+- **Connection Info**: Automatically generates the MCP SSE URL for your AI client (e.g., Cursor, Claude Desktop).
+
+
 
 ## MCP Resources
 

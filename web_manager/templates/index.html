@@ -206,29 +206,69 @@
                     const file = event.target.files[0];
                     if (!file) return;
 
-                    const formData = new FormData();
-                    formData.append('file', file);
+                    const label = event.target.nextElementSibling;
+                    const originalText = label.innerHTML;
+                    
+                    // Progress bar UI
+                    label.innerHTML = `
+                        <div class="flex items-center">
+                            <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            <span id="upload-progress-text">Uploading 0%...</span>
+                        </div>
+                    `;
+                    label.classList.add('opacity-75', 'cursor-wait');
 
                     try {
-                        const res = await fetch('/api/upload', {
-                            method: 'POST',
-                            body: formData
+                        const formData = new FormData();
+                        formData.append('file', file);
+                        
+                        await new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open('POST', '/api/upload', true);
+                            
+                            xhr.upload.onprogress = (e) => {
+                                if (e.lengthComputable) {
+                                    const percentComplete = Math.round((e.loaded / e.total) * 100);
+                                    const progressText = document.getElementById('upload-progress-text');
+                                    if (progressText) {
+                                        progressText.innerText = `Uploading ${percentComplete}%...`;
+                                    }
+                                }
+                            };
+                            
+                            xhr.onload = async () => {
+                                if (xhr.status === 200) {
+                                    resolve(JSON.parse(xhr.responseText));
+                                } else {
+                                    reject(new Error(xhr.responseText || xhr.statusText));
+                                }
+                            };
+                            
+                            xhr.onerror = () => {
+                                reject(new Error("Network Error"));
+                            };
+                            
+                            xhr.send(formData);
                         });
-                        if (res.ok) {
-                            this.loadFiles();
-                            event.target.value = ''; // Reset input
-                        } else {
-                            alert('Upload failed');
-                        }
+
+                        await this.loadFiles();
+                        event.target.value = ''; // Reset input
                     } catch (e) {
-                        alert('Error uploading file');
+                        alert('Upload failed: ' + e.message);
+                        console.error(e);
+                    } finally {
+                        label.innerHTML = originalText;
+                        label.classList.remove('opacity-75', 'cursor-wait');
                     }
                 },
 
                 async deleteFile(filename) {
                     if (!confirm(`Are you sure you want to delete ${filename}?`)) return;
                     
-                    const res = await fetch(`/api/files/${filename}`, { method: 'DELETE' });
+                    const res = await fetch(`/api/files/${encodeURIComponent(filename)}`, { method: 'DELETE' });
                     if (res.ok) this.loadFiles();
                 },
 

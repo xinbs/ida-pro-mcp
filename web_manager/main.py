@@ -4,6 +4,8 @@ import subprocess
 import signal
 import sys
 import psutil
+import re
+import json
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -16,8 +18,28 @@ import logging
 # Configuration
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploaded_files")
 SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
-# Default IDA directory - can be overridden by env var
-IDA_DIR = os.environ.get("IDADIR", r"C:\Program Files\IDA Professional 9.2")
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+
+def load_ida_path():
+    # 1. Environment variable has highest priority
+    if os.environ.get("IDADIR"):
+        return os.environ["IDADIR"]
+    
+    # 2. Config file
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                if "ida_path" in config and config["ida_path"]:
+                    return config["ida_path"]
+        except Exception as e:
+            print(f"[WARN] Failed to load config.json: {e}")
+
+    # 3. Default fallback
+    return r"C:\Program Files\IDA Professional 9.2"
+
+IDA_DIR = load_ida_path()
+print(f"[INFO] Using IDA path: {IDA_DIR}")
 
 # Files to ignore in the file list (IDA temporary/intermediate files)
 IGNORED_EXTENSIONS = {".id0", ".id1", ".id2", ".nam", ".til", ".dmp", ".i64"}
@@ -94,6 +116,20 @@ class ProcessStatus(BaseModel):
 class StartRequest(BaseModel):
     filename: str
 
+# Global Event Loop for Sync-to-Async logging
+main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+@app.on_event("startup")
+async def startup_event():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+
+def log_message(message: str):
+    """Log to stdout and broadcast to Web UI"""
+    print(message, flush=True)
+    if main_loop and log_manager:
+        asyncio.run_coroutine_threadsafe(log_manager.broadcast(message), main_loop)
+
 # Helper Functions
 def get_files() -> List[FileInfo]:
     files = []
@@ -151,8 +187,14 @@ async def list_files():
     return get_files()
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    filename = file.filename
+def upload_file(file: UploadFile = File(...)):
+    log_message(f"[UPLOAD] Starting upload: {file.filename}")
+    
+    # Sanitize filename: replace spaces, parentheses and other special chars with underscores
+    # agent_windows (2).exe -> agent_windows_2_.exe
+    filename = re.sub(r'[ \(\)]+', '_', file.filename)
+    # Remove any other potentially dangerous characters, keep only alphanumeric, dot, dash, underscore
+    filename = re.sub(r'[^a-zA-Z0-9\._\-]', '', filename)
     
     # Security: Append "_" to executable extensions to prevent accidental execution
     executable_exts = {".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".msi", ".com", ".scr", ".pif"}
@@ -162,10 +204,25 @@ async def upload_file(file: UploadFile = File(...)):
         
     file_path = os.path.join(UPLOAD_DIR, filename)
     try:
+        # Use manual chunked copy to monitor progress and avoid memory issues
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            # 1MB chunks
+            chunk_size = 1024 * 1024
+            bytes_read = 0
+            while True:
+                chunk = file.file.read(chunk_size)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+                bytes_read += len(chunk)
+                # Print progress every ~10MB
+                if bytes_read % (10 * 1024 * 1024) < chunk_size:
+                    log_message(f"[UPLOAD] Processed {bytes_read / 1024 / 1024:.1f} MB...")
+                    
+        log_message(f"[UPLOAD] Successfully saved to: {file_path}")
         return {"filename": filename, "status": "uploaded"}
     except Exception as e:
+        log_message(f"[UPLOAD] Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/files/{filename}")
