@@ -178,7 +178,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         query_params = parse_qs(urlparse(self.path).query)
         session_id = query_params.get("session", [None])[0]
         if session_id is None:
-            self.send_error(400, "Missing ?session for SSE POST")
+            # Fallback: If no session ID is provided, treat it as a direct Streamable HTTP request
+            # This handles clients (like Codex) that might incorrectly POST to /sse without handshake
+            self._handle_mcp_post(body)
             return
 
         # Dispatch to MCP registry
