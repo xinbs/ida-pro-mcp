@@ -6,6 +6,7 @@ import sys
 import psutil
 import re
 import json
+from urllib.parse import unquote
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -99,11 +100,45 @@ templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "t
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+import hashlib
+from typing import Optional, List, Dict
+
+# ... (existing imports)
+
+# Simple in-memory cache for MD5 hashes to avoid re-reading large files constantly
+# Key: file_path, Value: (mtime, md5_hash)
+md5_cache: Dict[str, tuple[float, str]] = {}
+
+def calculate_md5(file_path: str) -> str:
+    """Calculate MD5 of a file with caching based on modification time"""
+    try:
+        stat = os.stat(file_path)
+        mtime = stat.st_mtime
+        
+        # Check cache
+        if file_path in md5_cache:
+            cached_mtime, cached_md5 = md5_cache[file_path]
+            if cached_mtime == mtime:
+                return cached_md5
+        
+        # Calculate fresh
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        
+        digest = hash_md5.hexdigest()
+        md5_cache[file_path] = (mtime, digest)
+        return digest
+    except Exception:
+        return "error"
+
 # Models
 class FileInfo(BaseModel):
     filename: str
     size: int
     path: str
+    md5: str
     has_intermediate_files: bool = False
 
 class ProcessStatus(BaseModel):
@@ -161,6 +196,7 @@ def get_files() -> List[FileInfo]:
                     filename=f,
                     size=os.path.getsize(path),
                     path=path,
+                    md5=calculate_md5(path),
                     has_intermediate_files=has_intermediate_files(f)
                 ))
     return sorted(files, key=lambda x: x.filename)
@@ -204,14 +240,32 @@ async def list_files():
     return get_files()
 
 @app.post("/api/upload")
-def upload_file(file: UploadFile = File(...)):
-    log_message(f"[UPLOAD] Starting upload: {file.filename}")
+async def upload_file(request: Request):
+    # Get filename from header
+    raw_filename = request.headers.get("X-Filename")
+    if not raw_filename:
+        raise HTTPException(status_code=400, detail="Missing X-Filename header")
+    
+    # Decode URL-encoded filename (from frontend encodeURIComponent)
+    raw_filename = unquote(raw_filename)
+    
+    # Check for simple obfuscation
+    is_xor = request.headers.get("X-Obfuscation") == "xor"
+    
+    log_message(f"[UPLOAD] Starting upload: {raw_filename} (XOR: {is_xor})")
     
     # Sanitize filename: replace spaces, parentheses and other special chars with underscores
     # agent_windows (2).exe -> agent_windows_2_.exe
-    filename = re.sub(r'[ \(\)]+', '_', file.filename)
+    filename = re.sub(r'[ \(\)]+', '_', raw_filename)
     # Remove any other potentially dangerous characters, keep only alphanumeric, dot, dash, underscore
+    # NOTE: This regex strips non-ASCII characters. If filename becomes empty, we generate a fallback name.
     filename = re.sub(r'[^a-zA-Z0-9\._\-]', '', filename)
+    
+    # Fallback if filename became empty (e.g. was all unicode)
+    if not filename:
+        import uuid
+        filename = f"upload_{uuid.uuid4().hex[:8]}"
+        log_message(f"[UPLOAD] Filename sanitized to empty, using fallback: {filename}")
     
     # Security: Append "_" to executable extensions to prevent accidental execution
     executable_exts = {".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".msi", ".com", ".scr", ".pif"}
@@ -223,24 +277,35 @@ def upload_file(file: UploadFile = File(...)):
     try:
         # Use manual chunked copy to monitor progress and avoid memory issues
         with open(file_path, "wb") as buffer:
-            # 1MB chunks
-            chunk_size = 1024 * 1024
+            # 64KB chunks for smoother progress and responsiveness
+            chunk_size = 64 * 1024
             bytes_read = 0
-            while True:
-                chunk = file.file.read(chunk_size)
-                if not chunk:
-                    break
-                buffer.write(chunk)
+            loop = asyncio.get_running_loop()
+            
+            async for chunk in request.stream():
+                if is_xor:
+                    # De-obfuscate (XOR 0x42)
+                    # We can use numpy or simple list comp, but for chunks standard bytes loop is fine or bytes.translate
+                    # Creating a translation table is fastest
+                    # 0x42 = 66
+                    chunk = bytes(b ^ 0x42 for b in chunk)
+                
+                # Run blocking write in executor to avoid blocking the event loop
+                await loop.run_in_executor(None, buffer.write, chunk)
+                
                 bytes_read += len(chunk)
-                # Print progress every ~10MB
-                if bytes_read % (10 * 1024 * 1024) < chunk_size:
+                # Print progress every ~5MB
+                if bytes_read % (5 * 1024 * 1024) < chunk_size:
                     log_message(f"[UPLOAD] Processed {bytes_read / 1024 / 1024:.1f} MB...")
                     
         log_message(f"[UPLOAD] Successfully saved to: {file_path}")
         return {"filename": filename, "status": "uploaded"}
     except Exception as e:
-        log_message(f"[UPLOAD] Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        traceback.print_exc()
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        log_message(f"[UPLOAD] Error: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.delete("/api/files/{filename}")
 async def delete_file(filename: str):

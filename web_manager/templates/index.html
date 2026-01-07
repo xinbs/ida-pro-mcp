@@ -107,7 +107,15 @@
                 <tbody class="divide-y divide-gray-100">
                     <template x-for="file in files" :key="file.filename">
                         <tr class="hover:bg-gray-50 transition">
-                            <td class="px-6 py-4 font-medium text-gray-900" x-text="file.filename"></td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <div class="text-sm font-medium text-gray-900" x-text="file.filename"></div>
+                                <div class="text-xs text-gray-500 font-mono mt-1 group cursor-pointer" 
+                                     @click="navigator.clipboard.writeText(file.md5)" 
+                                     title="Click to copy MD5">
+                                    <span x-text="'MD5: ' + file.md5"></span>
+                                    <span class="hidden group-hover:inline ml-1 text-blue-500">📋</span>
+                                </div>
+                            </td>
                             <td class="px-6 py-4 text-gray-500" x-text="formatBytes(file.size)"></td>
                             <td class="px-6 py-4 text-right space-x-2">
                                 <button @click="startService(file.filename)" 
@@ -229,12 +237,18 @@
                     label.classList.add('opacity-75', 'cursor-wait');
 
                     try {
-                        const formData = new FormData();
-                        formData.append('file', file);
-                        
+                        // Use raw binary upload to avoid multipart/form-data buffering in system temp
+                        // which might trigger AV on malware samples.
                         await new Promise((resolve, reject) => {
                             const xhr = new XMLHttpRequest();
                             xhr.open('POST', '/api/upload', true);
+                            
+                            // Pass filename in header
+                            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+                            
+                            // Enable XOR obfuscation to bypass AV network filters
+                            xhr.setRequestHeader('X-Obfuscation', 'xor');
+                            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
                             
                             xhr.upload.onprogress = (e) => {
                                 if (e.lengthComputable) {
@@ -258,7 +272,21 @@
                                 reject(new Error("Network Error"));
                             };
                             
-                            xhr.send(formData);
+                            // Read file and XOR it
+                            const reader = new FileReader();
+                            reader.onload = function(e) {
+                                const buffer = e.target.result;
+                                const view = new Uint8Array(buffer);
+                                // XOR with 0x42
+                                for (let i = 0; i < view.length; i++) {
+                                    view[i] ^= 0x42;
+                                }
+                                xhr.send(view);
+                            };
+                            reader.onerror = function(e) {
+                                reject(new Error("File Read Error: " + e.target.error));
+                            };
+                            reader.readAsArrayBuffer(file);
                         });
 
                         await this.loadFiles();

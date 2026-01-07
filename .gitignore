@@ -25,3 +25,4 @@ venv*/
 web_manager/uploaded_files/*
 # Generated server files
 server_generated.py
+web_manager/config.json
