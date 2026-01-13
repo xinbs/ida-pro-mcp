@@ -117,24 +117,33 @@
                                 </div>
                             </td>
                             <td class="px-6 py-4 text-gray-500" x-text="formatBytes(file.size)"></td>
-                            <td class="px-6 py-4 text-right space-x-2">
-                                <button @click="startService(file.filename)" 
+                            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                <div class="flex items-center justify-end space-x-3">
+                                    <label class="inline-flex items-center" title="Enable full auto-analysis (slower, more memory)">
+                                        <input type="checkbox" class="form-checkbox h-4 w-4 text-indigo-600 transition duration-150 ease-in-out" x-model="file.auto_analysis">
+                                        <span class="ml-2 text-gray-600 text-xs">Auto-Analysis</span>
+                                    </label>
+                                    
+                                    <button @click="startService(file)" 
                                         :disabled="status.running"
-                                        class="text-green-600 hover:text-green-900 disabled:opacity-50 disabled:cursor-not-allowed font-medium">
-                                    Start Analysis
-                                </button>
-                                <button @click="cleanupFile(file.filename)" 
-                                    :disabled="(status.running && status.filename === file.filename) || !file.has_intermediate_files"
-                                    :class="file.has_intermediate_files ? 'text-yellow-600 hover:text-yellow-900' : 'text-gray-400 cursor-not-allowed'"
-                                    class="font-medium mr-3 disabled:opacity-50"
-                                    :title="file.has_intermediate_files ? 'Clean intermediate files (.id0, .nam, etc)' : 'No intermediate files found'">
-                                    Clean
-                                </button>
-                                <button @click="deleteFile(file.filename)" 
+                                        class="text-green-600 hover:text-green-900 disabled:opacity-50 disabled:cursor-not-allowed font-bold">
+                                        Start
+                                    </button>
+                                    
+                                    <button @click="cleanupFile(file.filename)" 
+                                        :disabled="(status.running && status.filename === file.filename) || !file.has_intermediate_files"
+                                        :class="file.has_intermediate_files ? 'text-yellow-600 hover:text-yellow-900' : 'text-gray-400 cursor-not-allowed'"
+                                        class="font-medium disabled:opacity-50"
+                                        :title="file.has_intermediate_files ? 'Clean intermediate files (.id0, .nam, etc)' : 'No intermediate files found'">
+                                        Clean
+                                    </button>
+                                    
+                                    <button @click="deleteFile(file.filename)" 
                                         :disabled="status.running && status.filename === file.filename"
                                         class="text-red-600 hover:text-red-900 disabled:opacity-50 disabled:cursor-not-allowed">
-                                    Delete
-                                </button>
+                                        Delete
+                                    </button>
+                                </div>
                             </td>
                         </tr>
                     </template>
@@ -209,7 +218,9 @@
 
                 async loadFiles() {
                     const res = await fetch('/api/files');
-                    this.files = await res.json();
+                    const files = await res.json();
+                    // Initialize auto_analysis state for each file
+                    this.files = files.map(f => ({ ...f, auto_analysis: false }));
                 },
 
                 async loadStatus() {
@@ -325,20 +336,23 @@
                     }
                 },
 
-                async startService(filename) {
-                    if (!confirm(`Start analysis for ${filename}?`)) return;
+                async startService(file) {
+                    if (!confirm(`Start analysis for ${file.filename}?`)) return;
 
                     try {
                         const res = await fetch('/api/start', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ filename })
+                            body: JSON.stringify({ 
+                                filename: file.filename,
+                                auto_analysis: file.auto_analysis
+                            })
                         });
                         
                         if (res.ok) {
                             // Wait a bit for the server to initialize
                             setTimeout(() => this.loadStatus(), 1000);
-                            this.status.filename = filename;
+                            this.status.filename = file.filename;
                             this.status.running = true;
                         } else {
                             const err = await res.json();

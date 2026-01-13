@@ -6,7 +6,7 @@ from typing import TypeVar, cast
 from http.server import HTTPServer
 
 from .sync import idaread, idawrite
-from .rpc import McpRpcRegistry, McpHttpRequestHandler, MCP_SERVER, MCP_UNSAFE
+from .rpc import McpRpcRegistry, McpHttpRequestHandler, MCP_SERVER, MCP_UNSAFE, get_cached_output
 
 
 T = TypeVar("T")
@@ -101,12 +101,35 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
 
     def do_GET(self):
         """Handles GET requests."""
-        if urlparse(self.path).path == "/config.html":
+        path = urlparse(self.path).path
+        if path == "/config.html":
             if not self._check_host():
                 return
             self._handle_config_get()
+        elif path.startswith("/output/"):
+            self._handle_output_get(path)
         else:
             super().do_GET()
+
+    def _handle_output_get(self, path: str):
+        """Serve cached output files."""
+        try:
+            output_id = path.split("/")[-1].replace(".json", "")
+            data = get_cached_output(output_id)
+            
+            if data is None:
+                self.send_error(404, "Output not found or expired")
+                return
+
+            response = json.dumps(data, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(response)
+        except Exception as e:
+            self.send_error(500, f"Error serving output: {str(e)}")
 
     @property
     def server_port(self) -> int:

@@ -23,6 +23,7 @@ import ida_hexrays
 import ida_kernwin
 import ida_nalt
 import ida_typeinf
+import ida_gdl
 import idaapi
 import idautils
 import idc
@@ -807,6 +808,25 @@ def decompile_checked(addr: int):
     """Decompile a function and raise IDAError on failure"""
     if not ida_hexrays.init_hexrays_plugin():
         raise IDAError("Hex-Rays decompiler is not available")
+    
+    # Safety check: Prevent decompiling huge functions that might hang IDA
+    func = idaapi.get_func(addr)
+    if func:
+        # Check 1: Size in bytes
+        # User feedback: 32KB is too small for some legitimate functions.
+        # Increased to 256KB to accommodate larger functions while still preventing massive hangs.
+        if func.size() > 0x40000: # 256KB
+            raise IDAError(f"Function too large to decompile safely ({func.size()} bytes). Use disassembly instead.")
+        
+        # Check 2: Basic block count (approximation of complexity)
+        try:
+            fc = ida_gdl.FlowChart(func)
+            # Increased block limit to 4000 to allow complex but valid functions (e.g. large switch cases)
+            if fc.size > 4000:
+                raise IDAError(f"Function too complex to decompile safely ({fc.size} blocks). Use disassembly instead.")
+        except Exception:
+            pass # Skip check if FlowChart fails
+
     error = ida_hexrays.hexrays_failure_t()
     cfunc = ida_hexrays.decompile_func(addr, error, ida_hexrays.DECOMP_WARNINGS)
     if not cfunc:
@@ -831,7 +851,23 @@ def decompile_function_safe(ea: int) -> Optional[str]:
     try:
         if not ida_hexrays.init_hexrays_plugin():
             return None
+            
+        # Safety check for size
+        func = idaapi.get_func(ea)
+        if func:
+            if func.size() > 0x40000: # 256KB limit
+                return f"// Function too large to decompile ({func.size()} bytes). Decompilation skipped for safety."
+            
+            # Check 2: Basic block count
+            try:
+                fc = ida_gdl.FlowChart(func)
+                if fc.size > 4000:
+                    return f"// Function too complex to decompile ({fc.size} blocks). Decompilation skipped for safety."
+            except Exception:
+                pass
+
         error = ida_hexrays.hexrays_failure_t()
+        # Use DECOMP_NO_WAIT if available to avoid blocking, though it might not apply here directly
         cfunc = ida_hexrays.decompile_func(ea, error, ida_hexrays.DECOMP_WARNINGS)
         if not cfunc:
             return None

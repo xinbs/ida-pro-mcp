@@ -52,9 +52,48 @@ from .utils import (
     InsnPattern,
 )
 
+import threading
+import time
+
+# ============================================================================
+# Global Locks and Status
+# ============================================================================
+
+# Lock to prevent multiple heavy decompile tasks from piling up
+_DECOMPILE_LOCK = threading.Lock()
+_LAST_DECOMPILE_START = 0.0
+
 # ============================================================================
 # Advanced Analysis Tools (Local Extensions)
 # ============================================================================
+
+@tool
+@idasync
+def analyze_all(
+    wait: Annotated[bool, "Whether to wait for analysis to finish (default: False)"] = False
+) -> str:
+    """
+    Manually trigger IDA's auto-analysis for the entire database.
+    Use this if the initial analysis was skipped or if you need to ensure all cross-references are up to date.
+    
+    If wait=False (default), it returns immediately and analysis runs in the background.
+    If wait=True, it blocks until analysis is complete (warning: may take a long time).
+    """
+    import ida_auto
+    
+    # Enable auto-analysis
+    ida_auto.enable_auto(True)
+    
+    # Mark the entire address space for analysis
+    # This effectively tells IDA to re-scan everything
+    inf = idaapi.get_inf_structure()
+    ida_auto.plan_range(inf.min_ea, inf.max_ea)
+    
+    if wait:
+        ida_auto.auto_wait()
+        return "Analysis completed."
+    else:
+        return "Analysis triggered in background."
 
 @tool
 @idasync
@@ -62,22 +101,69 @@ def find_crypt_constants(
     limit: Annotated[int, "Max matches per constant type (default: 100)"] = 100
 ) -> dict:
     """Identify common cryptographic constants (AES S-Boxes, MD5/SHA initializers, etc.)"""
-    # This is a placeholder for the advanced crypto scanner
-    # In a real implementation, this would scan for byte patterns
-    # For now, we'll implement a basic scanner for common constants
+    import ida_bytes
+    import ida_search
+    import ida_idaapi
+    import struct
     
     results = {}
+    found_count = 0
     
     # Common crypto constants (Little Endian)
+    # Value is list of dwords
     signatures = {
         "MD5_Init": [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476],
         "SHA1_Init": [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
-        "AES_Te0": [0xA56363C6, 0x847C7C84, 0x99777799, 0x8D7B7B8D], # Partial AES table
+        "SHA256_Init": [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 
+                        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19],
+        "AES_Te0": [0xA56363C6, 0x847C7C84, 0x99777799, 0x8D7B7B8D], # Partial AES T-table
+        "AES_Te1": [0x6363C6A5, 0x7C7C8484, 0x77779999, 0x7B7B8D8D], 
+        "AES_Te2": [0x63C6A563, 0x7C84847C, 0x77999977, 0x7B8D8D7B],
+        "AES_Te3": [0xC6A56363, 0x84847C7C, 0x99997777, 0x8D8D7B7B],
+        "Rijndael_SBox": [0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 
+                          0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76], # First 16 bytes
     }
     
-    # Scan logic would go here
-    # For this sync, we just ensure the function signature exists
-    return {"status": "Not fully implemented in this merge", "found": []}
+    min_ea = ida_idaapi.cvar.inf.min_ea
+    max_ea = ida_idaapi.cvar.inf.max_ea
+    
+    for name, pattern_ints in signatures.items():
+        if found_count >= limit:
+            break
+            
+        # Convert integers to byte pattern string for find_binary
+        # We assume Little Endian for multi-byte constants
+        pattern_bytes = b""
+        if name == "Rijndael_SBox":
+            # Byte array
+            pattern_bytes = bytes(pattern_ints)
+        else:
+            # DWORD array
+            for val in pattern_ints:
+                pattern_bytes += struct.pack("<I", val)
+                
+        # Convert to IDA search string format: "01 23 45 67 ..."
+        search_str = " ".join(f"{b:02X}" for b in pattern_bytes)
+        
+        # Search
+        ea = min_ea
+        matches = []
+        while True:
+            ea = ida_search.find_binary(ea, max_ea, search_str, 16, ida_search.SEARCH_DOWN)
+            if ea == ida_idaapi.BADADDR:
+                break
+                
+            matches.append(hex(ea))
+            ea += len(pattern_bytes) # Skip past this match
+            
+            if len(matches) >= 10: # Limit matches per type
+                break
+        
+        if matches:
+            results[name] = matches
+            found_count += len(matches)
+            
+    return {"found": results, "count": found_count}
 
 @tool
 @idasync
@@ -194,11 +280,46 @@ def _get_cached_strings_dict() -> list[dict]:
 
 
 @tool
-@idasync
+def check_task_status(
+    task_id: Annotated[str, "The Task ID returned by an async tool call"],
+) -> dict:
+    """Check the status of an asynchronous background task"""
+    from .sync import get_task_result
+    return get_task_result(task_id)
+
+@tool
 def decompile(
     addrs: Annotated[list[str] | str, "Function addresses to decompile"],
+    background: Annotated[bool, "Run in background (returns task_id) to avoid timeout. NOTE: IDA's main thread will be blocked during execution, so other tools may be unresponsive until the task completes, but the MCP server will remain responsive. Use this for complex functions that might timeout."] = False
 ) -> list[dict]:
     """Decompile functions to pseudocode"""
+    # Check lock to prevent request pile-up
+    global _LAST_DECOMPILE_START
+    
+    if background:
+        from .sync import submit_task
+        task_id = submit_task(_decompile_raw, addrs, is_heavy=True)
+        return [{"task_id": task_id, "status": "pending", "message": "Decompilation started in background. Use check_task_status to get results."}]
+
+    if not _DECOMPILE_LOCK.acquire(blocking=False):
+        duration = time.time() - _LAST_DECOMPILE_START
+        return [{
+            "error": f"Server is busy with another decompile task (running for {duration:.1f}s). Please wait for it to finish.",
+            "status": "busy"
+        }]
+    
+    try:
+        _LAST_DECOMPILE_START = time.time()
+        # Synchronous execution: use idasync wrapper (or call _decompile_raw inside idawrite if it wasn't already wrapped)
+        # Note: _decompile_raw is NOT decorated, so we must wrap it for sync execution
+        from .sync import idawrite
+        return idawrite(_decompile_raw)(addrs)
+    finally:
+        _DECOMPILE_LOCK.release()
+
+def _decompile_raw(
+    addrs: Annotated[list[str] | str, "Function addresses to decompile"],
+) -> list[dict]:
     addrs = normalize_list_input(addrs)
     results = []
 

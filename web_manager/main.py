@@ -151,6 +151,7 @@ class ProcessStatus(BaseModel):
 
 class StartRequest(BaseModel):
     filename: str
+    auto_analysis: bool = False
 
 # Global Event Loop for Sync-to-Async logging
 main_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -333,9 +334,11 @@ def clean_intermediate_files(filename: str) -> bool:
     """Helper to remove .id0, .id1, .nam, .til, .i64, .dmp files"""
     cleaned = False
     base_path = os.path.join(UPLOAD_DIR, filename)
+    # Normalize paths to prevent accidental deletion of the source file
+    abs_base_path = os.path.abspath(base_path)
     
-    # Extensions to clean
-    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".dmp"]
+    # Extensions to clean (added .idb for 32-bit DBs)
+    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".dmp", ".idb"]
     
     # 1. Check exact matches (e.g. binary.exe -> binary.id0) - IDA < 7 style or some settings
     # 2. Check appended matches (e.g. binary.exe -> binary.exe.id0) - Common IDA style
@@ -344,6 +347,10 @@ def clean_intermediate_files(filename: str) -> bool:
     root, _ = os.path.splitext(base_path)
     for ext in exts:
         p = root + ext
+        # SAFETY CHECK: Never delete the source file itself
+        if os.path.abspath(p) == abs_base_path:
+            continue
+            
         if os.path.exists(p):
             try:
                 os.remove(p)
@@ -355,6 +362,10 @@ def clean_intermediate_files(filename: str) -> bool:
     # Case B: binary.exe.id0 (appending extension)
     for ext in exts:
         p = base_path + ext
+        # SAFETY CHECK: Never delete the source file itself (unlikely here but good practice)
+        if os.path.abspath(p) == abs_base_path:
+            continue
+
         if os.path.exists(p):
             try:
                 os.remove(p)
@@ -410,6 +421,10 @@ async def start_process(req: StartRequest):
     env["PYTHONPATH"] = SRC_DIR
     env["IDADIR"] = IDA_DIR
     
+    # Set the public URL for the MCP server so that download links are correct for LAN users
+    local_ip = get_local_ip()
+    env["IDA_MCP_URL"] = f"http://{local_ip}:{current_process.port}"
+    
     # Force output buffering off to ensure real-time logs
     env["PYTHONUNBUFFERED"] = "1"
     
@@ -418,9 +433,13 @@ async def start_process(req: StartRequest):
         sys.executable,
         "-m", "ida_pro_mcp.idalib_server",
         "--host", "0.0.0.0",
-        "--port", str(current_process.port),
-        file_path
+        "--port", str(current_process.port)
     ]
+    
+    if req.auto_analysis:
+        cmd.append("--auto-analysis")
+        
+    cmd.append(file_path)
     
     try:
         log_manager.clear()
@@ -479,8 +498,55 @@ async def stop_process():
         raise HTTPException(status_code=500, detail=f"Failed to stop process: {str(e)}")
 
 def get_local_ip():
-    import socket
+    """
+    Get the local IP address, prioritizing LAN addresses (192.168.x.x, 10.x.x.x)
+    over virtual/container addresses (172.x.x.x) and localhost.
+    """
+    # 1. Check environment variable override
+    if os.environ.get("IDA_MCP_HOST"):
+        return os.environ["IDA_MCP_HOST"]
+
+    candidates = []
     try:
+        import psutil
+        import socket
+        
+        # Get all interface addresses
+        for interface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET:
+                    ip = addr.address
+                    if ip == "127.0.0.1":
+                        continue
+                        
+                    # Score IPs based on likelihood of being the main LAN IP
+                    score = 0
+                    if ip.startswith("192.168."):
+                        score = 100
+                    elif ip.startswith("10."):
+                        score = 90
+                    elif ip.startswith("172."):
+                        # 172.16.x.x - 172.31.x.x are private, others public
+                        # Docker/WSL often use 172.17.x.x, 172.18.x.x etc.
+                        # We give these lower priority as they are often virtual
+                        score = 50
+                    else:
+                        # Public IP or other
+                        score = 70
+                        
+                    candidates.append((score, ip))
+    except Exception as e:
+        print(f"[WARN] Failed to list interfaces: {e}")
+
+    # Sort by score descending
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    if candidates:
+        return candidates[0][1]
+
+    # Fallback to socket method if psutil failed or found nothing
+    try:
+        import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]

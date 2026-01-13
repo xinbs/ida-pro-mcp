@@ -43,10 +43,64 @@ HEADLESS_MODE = False
 HEADLESS_QUEUE = queue.Queue()
 # -----------------------------
 
+import uuid
+import time
+
+# Task Store for Async Operations
+# { task_id: { "status": "pending"|"done"|"error", "result": ..., "error": ..., "created_at": ... } }
+TASK_STORE = {}
+
+# Global Busy Flag for Heavy Operations
+IS_BUSY_WITH_HEAVY_TASK = False
+
+def check_busy():
+    """Check if server is busy with a heavy task."""
+    if IS_BUSY_WITH_HEAVY_TASK:
+        raise IDAError("Server is busy with a heavy background task (e.g. decompile). Please wait.")
+
+def submit_task(func, *args, is_heavy: bool = False, **kwargs) -> str:
+    """Submit a task to the headless queue and return a Task ID immediately."""
+    task_id = str(uuid.uuid4())
+    TASK_STORE[task_id] = {
+        "status": "pending", 
+        "created_at": time.time()
+    }
+    
+    def wrapper():
+        if is_heavy:
+            global IS_BUSY_WITH_HEAVY_TASK
+            IS_BUSY_WITH_HEAVY_TASK = True
+        try:
+            # Execute with write safety
+            res = func(*args, **kwargs)
+            TASK_STORE[task_id]["status"] = "done"
+            TASK_STORE[task_id]["result"] = res
+        except Exception as e:
+            TASK_STORE[task_id]["status"] = "error"
+            TASK_STORE[task_id]["error"] = str(e)
+        finally:
+            if is_heavy:
+                IS_BUSY_WITH_HEAVY_TASK = False
+            
+    if HEADLESS_MODE:
+        HEADLESS_QUEUE.put(wrapper)
+    else:
+        # GUI mode: execute in main thread via request_ui_thread (MFF_WRITE)
+        idaapi.execute_sync(wrapper, idaapi.MFF_WRITE)
+        
+    return task_id
+
+def get_task_result(task_id: str) -> dict:
+    """Get the result of an async task."""
+    return TASK_STORE.get(task_id, {"status": "not_found"})
+
 import threading
 
 def _sync_wrapper(ff, safety_mode: IDASafety):
     """Call a function ff with a specific IDA safety_mode."""
+    # Fast-fail if server is busy with a heavy task
+    check_busy()
+    
     if safety_mode not in [IDASafety.SAFE_READ, IDASafety.SAFE_WRITE]:
         error_str = f"Invalid safety mode {safety_mode} over function {ff.__name__}"
         logger.error(error_str)

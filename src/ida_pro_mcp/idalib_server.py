@@ -31,6 +31,12 @@ def main():
         "--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)"
     )
     parser.add_argument(
+        "--auto-analysis", 
+        action="store_true", 
+        default=False,
+        help="Enable IDA auto-analysis on startup (default: False)"
+    )
+    parser.add_argument(
         "input_path", type=Path, help="Path to the input file to analyze."
     )
     args = parser.parse_args()
@@ -61,16 +67,22 @@ def main():
     # We must ensure IDAlib is properly initialized.
     try:
         # Revert: use simple string conversion as resolve() might cause issues on Windows
-        if idapro.open_database(str(args.input_path), run_auto_analysis=True):
-            raise RuntimeError("failed to analyze input file")
+        # OPTIMIZATION: Use --auto-analysis flag to control behavior. 
+        # Default is False to prevent infinite analysis loops / high memory usage on malware.
+        ret_code = idapro.open_database(str(args.input_path), run_auto_analysis=args.auto_analysis)
+        if ret_code != 0:
+            logger.warning(f"idapro.open_database returned code {ret_code}. This might indicate incomplete analysis or a warning, but we will proceed.")
+            # raise RuntimeError("failed to analyze input file") # Do not crash, proceed to try serving
     except OSError as e:
         # Catch the specific access violation if possible, or just log critical error
         logger.critical(f"Critical error opening database: {e}")
         logger.critical("This often happens if the input file format is not recognized or IDA loader crashes.")
         sys.exit(1)
 
-    logger.debug("idalib: waiting for analysis...")
-    ida_auto.auto_wait()
+    logger.debug("idalib: database opened, analysis running in background...")
+    # OPTIMIZATION: Do NOT block on auto_wait(). 
+    # This allows the MCP server to start immediately while IDA analyzes in the background.
+    # ida_auto.auto_wait() 
 
     # Setup signal handlers to ensure IDA database is properly closed on shutdown.
     # When a signal arrives, our handlers execute first, allowing us to close the
