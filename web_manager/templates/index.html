@@ -38,9 +38,13 @@
                             <p class="text-gray-600">Uptime: <span class="font-mono text-gray-900" x-text="formatUptime(status.uptime_seconds)"></span></p>
                             <div class="mt-4 p-3 bg-blue-50 rounded border border-blue-100">
                                 <p class="text-sm text-blue-800 font-semibold mb-1">MCP Connection URL:</p>
-                                <div class="flex items-center">
+                                <div class="flex items-center" x-data="{ copied: false }">
                                     <code class="flex-1 font-mono text-sm text-blue-900 bg-white px-2 py-1 rounded border border-blue-200" x-text="status.mcp_url"></code>
-                                    <button @click="copyUrl()" class="ml-2 text-blue-600 hover:text-blue-800 text-sm">Copy</button>
+                                    <button @click="copyToClipboard(status.mcp_url).then(() => { copied = true; setTimeout(() => copied = false, 2000); }).catch(() => prompt('Copy URL:', status.mcp_url))" 
+                                            class="ml-2 text-sm transition-colors duration-200"
+                                            :class="copied ? 'text-green-600 font-bold' : 'text-blue-600 hover:text-blue-800'"
+                                            x-text="copied ? 'Copied!' : 'Copy'">
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -108,12 +112,13 @@
                     <template x-for="file in files" :key="file.filename">
                         <tr class="hover:bg-gray-50 transition">
                             <td class="px-6 py-4 whitespace-nowrap">
-                                <div class="text-sm font-medium text-gray-900" x-text="file.filename"></div>
+                                <div class="text-sm font-medium text-gray-900 truncate max-w-xs sm:max-w-sm md:max-w-md" :title="file.filename" x-text="file.filename"></div>
                                 <div class="text-xs text-gray-500 font-mono mt-1 group cursor-pointer" 
-                                     @click="navigator.clipboard.writeText(file.md5)" 
+                                     x-data="{ copied: false }"
+                                     @click="copyToClipboard(file.md5).then(() => { copied = true; setTimeout(() => copied = false, 2000); }).catch(() => prompt('Copy MD5:', file.md5))" 
                                      title="Click to copy MD5">
-                                    <span x-text="'MD5: ' + file.md5"></span>
-                                    <span class="hidden group-hover:inline ml-1 text-blue-500">📋</span>
+                                    <span x-text="copied ? 'Copied!' : 'MD5: ' + file.md5" :class="copied ? 'text-green-600 font-bold' : ''"></span>
+                                    <span class="hidden group-hover:inline ml-1" :class="copied ? 'text-green-500' : 'text-blue-500'" x-text="copied ? '✓' : '📋'"></span>
                                 </div>
                             </td>
                             <td class="px-6 py-4 text-gray-500" x-text="formatBytes(file.size)"></td>
@@ -374,9 +379,54 @@
                     }
                 },
 
+                copyToClipboard(text) {
+                    if (!text) return Promise.reject('No text to copy');
+                    
+                    // 1. Try modern API (works in secure contexts)
+                    if (navigator.clipboard && window.isSecureContext) {
+                        return navigator.clipboard.writeText(text);
+                    }
+                    
+                    // 2. Fallback for non-secure contexts (e.g. HTTP LAN)
+                    return new Promise((resolve, reject) => {
+                        try {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = text;
+                            
+                            // Ensure it's part of DOM but invisible
+                            textArea.style.position = "fixed";
+                            textArea.style.left = "-9999px";
+                            textArea.style.top = "0";
+                            textArea.setAttribute('readonly', '');
+                            document.body.appendChild(textArea);
+                            
+                            textArea.focus();
+                            textArea.select();
+                            
+                            const successful = document.execCommand('copy');
+                            document.body.removeChild(textArea);
+                            
+                            if (successful) {
+                                resolve();
+                            } else {
+                                reject(new Error('execCommand copy failed'));
+                            }
+                        } catch (err) {
+                            reject(err);
+                        }
+                    });
+                },
+
                 copyUrl() {
                     if (this.status.mcp_url) {
-                        navigator.clipboard.writeText(this.status.mcp_url);
+                        this.copyToClipboard(this.status.mcp_url)
+                            .then(() => {
+                                // Optional: Global feedback or specific feedback handled by caller
+                            })
+                            .catch(err => {
+                                console.error('Copy failed:', err);
+                                prompt("Copy to clipboard: Ctrl+C, Enter", this.status.mcp_url);
+                            });
                     }
                 },
 
