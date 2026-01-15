@@ -43,7 +43,7 @@ IDA_DIR = load_ida_path()
 print(f"[INFO] Using IDA path: {IDA_DIR}")
 
 # Files to ignore in the file list (IDA temporary/intermediate files)
-IGNORED_EXTENSIONS = {".id0", ".id1", ".id2", ".nam", ".til", ".dmp", ".i64"}
+IGNORED_EXTENSIONS = {".id0", ".id1", ".id2", ".nam", ".til", ".i64"}
 
 # Global State
 class ProcessState:
@@ -152,6 +152,7 @@ class ProcessStatus(BaseModel):
 class StartRequest(BaseModel):
     filename: str
     auto_analysis: bool = False
+    loader: Optional[str] = None
 
 # Global Event Loop for Sync-to-Async logging
 main_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -171,7 +172,7 @@ def log_message(message: str):
 def has_intermediate_files(filename: str) -> bool:
     """Check if any intermediate files exist for a given filename"""
     base_path = os.path.join(UPLOAD_DIR, filename)
-    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".dmp"]
+    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64"]
     
     root, _ = os.path.splitext(base_path)
     for ext in exts:
@@ -338,7 +339,7 @@ def clean_intermediate_files(filename: str) -> bool:
     abs_base_path = os.path.abspath(base_path)
     
     # Extensions to clean (added .idb for 32-bit DBs)
-    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".dmp", ".idb"]
+    exts = [".id0", ".id1", ".id2", ".nam", ".til", ".i64", ".idb"]
     
     # 1. Check exact matches (e.g. binary.exe -> binary.id0) - IDA < 7 style or some settings
     # 2. Check appended matches (e.g. binary.exe -> binary.exe.id0) - Common IDA style
@@ -421,6 +422,111 @@ async def start_process(req: StartRequest):
     env["PYTHONPATH"] = SRC_DIR
     env["IDADIR"] = IDA_DIR
     
+    # Special handling for .DMP files: Pre-process with idat.exe if needed
+    # idalib often fails to create databases from DMP files due to debugger engine initialization issues.
+    # We use the headless IDA executable (idat.exe) to create the database first.
+    if req.filename.lower().endswith(".dmp") and not has_intermediate_files(req.filename):
+        log_message(f"[PRE-PROCESS] Detected .DMP file. Running pre-processing with idat.exe...")
+        
+        # Find idat.exe (Prefer idat64.exe for .DMP as they are often 64-bit)
+        idat_exe = None
+        idat64 = os.path.join(IDA_DIR, "idat64.exe")
+        idat32 = os.path.join(IDA_DIR, "idat.exe")
+        
+        if os.path.exists(idat64):
+            idat_exe = idat64
+        elif os.path.exists(idat32):
+            idat_exe = idat32
+            
+        if idat_exe:
+            log_message(f"[PRE-PROCESS] Using executable: {idat_exe}")
+            # Run idat.exe -A -c -Twindmp <file>
+            # -A: Autonomous mode
+            # -c: Create new database
+            # -Twindmp: Force Windows Crash Dump loader
+            # -L: Log to file (to capture errors if stdout is empty)
+            log_file = os.path.join(UPLOAD_DIR, f"{req.filename}.log")
+            pre_cmd = [idat_exe, "-A", "-c", "-Twindmp", f"-L{log_file}", file_path]
+            
+            # Use a clean environment for pre-processing to avoid loading the MCP plugin
+            # which might cause conflicts or crashes (internal error 3341) during DB creation.
+            pre_env = os.environ.copy()
+            pre_env["IDADIR"] = IDA_DIR
+            pre_env.pop("PYTHONPATH", None)
+            # Disable ONLY the MCP plugin auto-loading
+            # We MUST NOT set IDA_NO_PLUGINS=1 because loaders (like windmp) might rely on plugins.
+            pre_env["IDA_MCP_DISABLE"] = "1"
+            
+            # Add exit script for graceful shutdown
+            exit_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exit_ida.py")
+            if os.path.exists(exit_script):
+                pre_cmd.insert(4, f"-S\"{exit_script}\"")
+                log_message(f"[PRE-PROCESS] Using exit script: {exit_script}")
+            
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *pre_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=pre_env 
+                )
+                
+                log_message(f"[PRE-PROCESS] Running: {' '.join(pre_cmd)}")
+                stdout, stderr = await proc.communicate()
+                
+                # Log output for debugging
+                if stdout:
+                    log_message(f"[PRE-PROCESS] STDOUT: {stdout.decode('utf-8', errors='replace')[:500]}...")
+                if stderr:
+                    log_message(f"[PRE-PROCESS] STDERR: {stderr.decode('utf-8', errors='replace')[:500]}...")
+                
+                # Read log file if it exists
+                if os.path.exists(log_file):
+                    try:
+                        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                            log_content = f.read()
+                            if log_content:
+                                log_message(f"[PRE-PROCESS] IDA LOG:\n{log_content[-1000:]}") # Last 1000 chars
+                        # os.remove(log_file) # Keep for debugging
+                    except Exception as e:
+                        log_message(f"[PRE-PROCESS] Failed to read log file: {e}")
+
+                log_message(f"[PRE-PROCESS] Finished with code {proc.returncode}")
+                
+                # Check if DB was created AND has content
+                if has_intermediate_files(req.filename):
+                    # Verify file sizes
+                    base_path = os.path.join(UPLOAD_DIR, req.filename)
+                    root, _ = os.path.splitext(base_path)
+                    
+                    # Check for any valid database file
+                    db_extensions = [".i64", ".id0", ".idb"]
+                    db_found = False
+                    
+                    for ext in db_extensions:
+                        # Check both base_path + ext (e.g. file.exe.id0) and root + ext (e.g. file.id0)
+                        paths_to_check = [base_path + ext, root + ext]
+                        for path in paths_to_check:
+                            if os.path.exists(path) and os.path.getsize(path) > 0:
+                                db_found = True
+                                log_message(f"[PRE-PROCESS] Found valid database file: {os.path.basename(path)} ({os.path.getsize(path)} bytes)")
+                                break
+                        if db_found:
+                            break
+                    
+                    if db_found:
+                        log_message("[PRE-PROCESS] Database created successfully.")
+                    else:
+                        log_message("[PRE-PROCESS] Warning: Database files exist but appear empty/invalid. Creation failed.")
+                        # Try to clean up empty files
+                        clean_intermediate_files(req.filename)
+                else:
+                    log_message("[PRE-PROCESS] Warning: Database files not found. Analysis might fail.")
+            except Exception as e:
+                log_message(f"[PRE-PROCESS] Error executing idat: {e}")
+        else:
+            log_message("[PRE-PROCESS] Warning: idat.exe not found. Skipping pre-processing.")
+
     # Set the public URL for the MCP server so that download links are correct for LAN users
     local_ip = get_local_ip()
     env["IDA_MCP_URL"] = f"http://{local_ip}:{current_process.port}"
@@ -428,21 +534,72 @@ async def start_process(req: StartRequest):
     # Force output buffering off to ensure real-time logs
     env["PYTHONUNBUFFERED"] = "1"
     
-    # Construct command
-    cmd = [
-        sys.executable,
-        "-m", "ida_pro_mcp.idalib_server",
-        "--host", "0.0.0.0",
-        "--port", str(current_process.port)
-    ]
-    
+    # Disable ONLY the MCP plugin auto-loading (via our custom flag in ida_mcp.py)
+    # We MUST NOT set IDA_NO_PLUGINS=1 because loaders (like windmp) might rely on plugins (like windbg).
+    env["IDA_MCP_DISABLE"] = "1"
+    env["IDA_MCP_HOST"] = "0.0.0.0"
+    env["IDA_MCP_PORT"] = str(current_process.port)
     if req.auto_analysis:
-        cmd.append("--auto-analysis")
+        env["IDA_MCP_AUTO_ANALYSIS"] = "1"
+    if req.loader:
+        env["IDA_MCP_LOADER"] = req.loader
+    if req.filename.lower().endswith(".dmp"):
+        env["IDA_MCP_DMP_AUTO_START_DEBUGGER"] = "1"
+    
+    # Construct command
+    # Check if we should use native idat.exe (for .DMP files) or idalib
+    if req.filename.lower().endswith(".dmp"):
+        # Use idat.exe -A -S"script args" file
+        # Prefer idat.exe for .DMP as idat64.exe might not exist
+        idat_exe = None
+        idat64 = os.path.join(IDA_DIR, "idat64.exe")
+        idat32 = os.path.join(IDA_DIR, "idat.exe")
         
-    cmd.append(file_path)
+        if os.path.exists(idat64):
+            idat_exe = idat64
+        elif os.path.exists(idat32):
+            idat_exe = idat32
+        
+        if not idat_exe:
+             # Fallback if neither found (unlikely)
+             idat_exe = os.path.join(IDA_DIR, "idat.exe")
+            
+        script_path = os.path.join(SRC_DIR, "ida_pro_mcp", "idalib_server.py")
+        s_arg = f"-S{script_path}"
+            
+        # For .DMP files, ensure -Twindmp is passed to IDAT as well, just in case
+        # But IDAT opens the IDB if it exists, so -T might be ignored. 
+        # However, passing it doesn't hurt.
+        # WAIT: -T is an IDA argument, not script argument.
+        # But here we are constructing script arguments for idalib_server.py.
+        # idalib_server.py will "Inject" loader arg if passed.
+        # But since we are running in native mode, idalib_server.py doesn't control loading.
+        # So we should add -Twindmp to the MAIN command if we want to enforce it.
+        
+        # We made input_path optional in idalib_server.py for native mode, so we don't need to pass it here.
+        # This avoids duplicating the path in the command line.
+
+        log_file = os.path.join(UPLOAD_DIR, f"{req.filename}.server.log")
+        cmd = [idat_exe, "-A", "-Twindmp", f"-L{log_file}", s_arg, file_path]
+        log_message(f"[START] Using native {os.path.basename(idat_exe)} for .DMP file.")
+    else:
+        # Standard python execution via idalib
+        cmd = [
+            sys.executable,
+            "-m", "ida_pro_mcp.idalib_server",
+            "--host", "0.0.0.0",
+            "--port", str(current_process.port)
+        ]
+        
+        if req.auto_analysis:
+            cmd.append("--auto-analysis")
+            
+        if req.loader:
+            cmd.extend(["--loader", req.loader])
+            
+        cmd.append(file_path)
     
     try:
-        log_manager.clear()
         await log_manager.broadcast(f"Starting analysis for {req.filename}...")
         await log_manager.broadcast(f"Command: {' '.join(cmd)}")
         

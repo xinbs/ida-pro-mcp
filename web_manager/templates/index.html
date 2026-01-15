@@ -9,7 +9,7 @@
 </head>
 <body class="bg-gray-100 min-h-screen p-8" x-data="app()">
 
-    <div class="max-w-4xl mx-auto">
+    <div class="max-w-7xl mx-auto">
         <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
@@ -122,12 +122,22 @@
                                 </div>
                             </td>
                             <td class="px-6 py-4 text-gray-500" x-text="formatBytes(file.size)"></td>
-                            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                                <div class="flex items-center justify-end space-x-3">
+                            <td class="px-6 py-4 text-right text-sm font-medium">
+                                <div class="flex flex-wrap items-center justify-end gap-3">
                                     <label class="inline-flex items-center" title="Enable full auto-analysis (slower, more memory)">
                                         <input type="checkbox" class="form-checkbox h-4 w-4 text-indigo-600 transition duration-150 ease-in-out" x-model="file.auto_analysis">
                                         <span class="ml-2 text-gray-600 text-xs">Auto-Analysis</span>
                                     </label>
+                                    
+                                    <div>
+                                        <select x-model="file.loader" 
+                                                class="form-select h-8 text-xs border-gray-300 rounded shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                                                title="Force specific IDA loader (e.g. for Dump files)">
+                                            <template x-for="loader in loaders" :key="loader.value">
+                                                <option :value="loader.value" x-text="loader.label"></option>
+                                            </template>
+                                        </select>
+                                    </div>
                                     
                                     <button @click="startService(file)" 
                                         :disabled="status.running"
@@ -180,6 +190,16 @@
                 socket: null,
                 refreshInterval: null,
 
+                // Helper for loader selection
+                loaders: [
+                    { value: '', label: 'Default (Auto-detect)' },
+                    { value: 'windmp', label: 'Windows Dump (windmp)' },
+                    { value: 'pe', label: 'PE Executable (pe)' },
+                    { value: 'elf', label: 'ELF Executable (elf)' },
+                    { value: 'macho', label: 'Mach-O (macho)' },
+                    { value: 'binary', label: 'Binary/Raw (binary)' }
+                ],
+
                 init() {
                     this.loadFiles();
                     this.loadStatus();
@@ -224,8 +244,8 @@
                 async loadFiles() {
                     const res = await fetch('/api/files');
                     const files = await res.json();
-                    // Initialize auto_analysis state for each file
-                    this.files = files.map(f => ({ ...f, auto_analysis: false }));
+                    // Initialize auto_analysis state and loader for each file
+                    this.files = files.map(f => ({ ...f, auto_analysis: false, loader: '' }));
                 },
 
                 async loadStatus() {
@@ -350,7 +370,8 @@
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ 
                                 filename: file.filename,
-                                auto_analysis: file.auto_analysis
+                                auto_analysis: file.auto_analysis,
+                                loader: file.loader || null
                             })
                         });
                         

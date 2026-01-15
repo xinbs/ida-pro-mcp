@@ -50,7 +50,7 @@ from .tests import (
 
 # Cache for idautils.Strings() to avoid rebuilding on every call
 _strings_cache: Optional[list[String]] = None
-_strings_cache_md5: Optional[str] = None
+_strings_cache_md5: Optional[tuple[str, int]] = None
 
 
 def _get_cached_strings() -> list[String]:
@@ -58,7 +58,7 @@ def _get_cached_strings() -> list[String]:
     global _strings_cache, _strings_cache_md5
 
     # Get current IDB modification hash
-    current_md5 = ida_nalt.retrieve_input_file_md5()
+    current_md5 = (ida_nalt.retrieve_input_file_md5(), idaapi.get_strlist_qty())
 
     # Rebuild cache if needed
     if _strings_cache is None or _strings_cache_md5 != current_md5:

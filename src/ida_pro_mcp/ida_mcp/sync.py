@@ -1,6 +1,9 @@
 import logging
 import queue
 import functools
+import threading
+import time
+import uuid
 from enum import IntEnum
 import idaapi
 import ida_kernwin
@@ -42,9 +45,6 @@ call_stack = queue.LifoQueue()
 HEADLESS_MODE = False
 HEADLESS_QUEUE = queue.Queue()
 # -----------------------------
-
-import uuid
-import time
 
 # Task Store for Async Operations
 # { task_id: { "status": "pending"|"done"|"error", "result": ..., "error": ..., "created_at": ... } }
@@ -93,8 +93,6 @@ def submit_task(func, *args, is_heavy: bool = False, **kwargs) -> str:
 def get_task_result(task_id: str) -> dict:
     """Get the result of an async task."""
     return TASK_STORE.get(task_id, {"status": "not_found"})
-
-import threading
 
 def _sync_wrapper(ff, safety_mode: IDASafety):
     """Call a function ff with a specific IDA safety_mode."""

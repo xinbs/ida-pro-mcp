@@ -375,10 +375,32 @@ def get_image_size() -> int:
 
         omin_ea = ida_ida.inf_get_omin_ea()
         omax_ea = ida_ida.inf_get_omax_ea()
+    
     image_size = omax_ea - omin_ea
-    header = idautils.peutils_t().header()
-    if header and header[:4] == b"PE\0\0":
-        image_size = struct.unpack("<I", header[0x50:0x54])[0]
+    
+    # Sanity check for image_size (e.g. if omin_ea is BADADDR or max_ea < min_ea)
+    # Also check if it's unreasonably large (e.g. > 1TB) which might indicate wraparound or invalid bounds
+    if image_size <= 0 or image_size > 0x10000000000: # 1TB limit for sanity
+        import ida_ida
+        # Fallback to max_ea - min_ea which is usually more reliable for IDBs
+        image_size = ida_ida.inf_get_max_ea() - ida_ida.inf_get_min_ea()
+
+    # If still invalid, try to get from PE header if available
+    # But be careful, DMP files might have a PE header but the "image" in IDB 
+    # is actually a memory dump which is much larger than the PE header suggests.
+    # So we prefer IDB bounds first. Only use PE header if IDB bounds are completely broken.
+    if image_size <= 0:
+        header = idautils.peutils_t().header()
+        if header and header[:4] == b"PE\0\0":
+            try:
+                image_size = struct.unpack("<I", header[0x50:0x54])[0]
+            except Exception:
+                pass
+                
+    # Final fallback: return a default size if everything fails, to avoid validation errors
+    if image_size <= 0:
+        image_size = 0x100000 # 1MB default
+        
     return image_size
 
 

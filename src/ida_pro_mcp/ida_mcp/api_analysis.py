@@ -86,8 +86,9 @@ def analyze_all(
     
     # Mark the entire address space for analysis
     # This effectively tells IDA to re-scan everything
-    inf = idaapi.get_inf_structure()
-    ida_auto.plan_range(inf.min_ea, inf.max_ea)
+    min_ea = ida_ida.inf_get_min_ea()
+    max_ea = ida_ida.inf_get_max_ea()
+    ida_auto.plan_range(min_ea, max_ea)
     
     if wait:
         ida_auto.auto_wait()
@@ -101,7 +102,6 @@ def find_crypt_constants(
     limit: Annotated[int, "Max matches per constant type (default: 100)"] = 100
 ) -> dict:
     """Identify common cryptographic constants (AES S-Boxes, MD5/SHA initializers, etc.)"""
-    import ida_bytes
     import ida_search
     import ida_idaapi
     import struct
@@ -244,7 +244,7 @@ def emulate_snippet(
 
 # Cache for idautils.Strings() to avoid rebuilding on every call
 _strings_cache: Optional[list[dict]] = None
-_strings_cache_md5: Optional[str] = None
+_strings_cache_md5: Optional[tuple[str, int]] = None
 
 
 def _get_cached_strings_dict() -> list[dict]:
@@ -252,7 +252,7 @@ def _get_cached_strings_dict() -> list[dict]:
     global _strings_cache, _strings_cache_md5
 
     # Get current IDB modification hash
-    current_md5 = ida_nalt.retrieve_input_file_md5()
+    current_md5 = (ida_nalt.retrieve_input_file_md5(), idaapi.get_strlist_qty())
 
     # Rebuild cache if needed
     if _strings_cache is None or _strings_cache_md5 != current_md5:

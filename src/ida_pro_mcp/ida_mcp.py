@@ -36,6 +36,12 @@ class MCP(idaapi.plugin_t):
     MAX_PORT_TRIES = 10
 
     def init(self):
+        self.mcp = None
+        # Check if plugins are disabled via environment variable
+        import os
+        if os.environ.get("IDA_NO_PLUGINS") == "1" or os.environ.get("IDA_MCP_DISABLE") == "1":
+            return idaapi.PLUGIN_SKIP
+
         hotkey = MCP.wanted_hotkey.replace("-", "+")
         if __import__("sys").platform == "darwin":
             hotkey = hotkey.replace("Alt", "Option")
@@ -78,7 +84,7 @@ class MCP(idaapi.plugin_t):
                 raise
 
     def term(self):
-        if self.mcp:
+        if getattr(self, "mcp", None):
             self.mcp.stop()
 
 
