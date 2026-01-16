@@ -15,11 +15,17 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import asyncio
 import logging
+from starlette.requests import ClientDisconnect
+import base64
+import binascii
+import gzip
 
 # Configuration
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploaded_files")
 SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+
+_XOR_TABLE = bytes.maketrans(bytes(range(256)), bytes((b ^ 0x42) for b in range(256)))
 
 def load_ida_path():
     # 1. Environment variable has highest priority
@@ -235,7 +241,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request},
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 @app.get("/api/files", response_model=List[FileInfo])
 async def list_files():
@@ -276,32 +286,143 @@ async def upload_file(request: Request):
         filename += "_"
         
     file_path = os.path.join(UPLOAD_DIR, filename)
+    bytes_written = 0
     try:
-        # Use manual chunked copy to monitor progress and avoid memory issues
-        with open(file_path, "wb") as buffer:
-            # 64KB chunks for smoother progress and responsiveness
-            chunk_size = 64 * 1024
-            bytes_read = 0
-            loop = asyncio.get_running_loop()
-            
-            async for chunk in request.stream():
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+        body_encoding = request.headers.get("X-Content-Encoding")
+        body_compression = request.headers.get("X-Chunk-Compression")
+        chunk_offset = request.headers.get("X-Chunk-Offset")
+        chunk_total = request.headers.get("X-Chunk-Total")
+        chunk_final = request.headers.get("X-Chunk-Final")
+        chunk_len_hdr = request.headers.get("X-Chunk-Len")
+
+        offset: int | None = None
+        total: int | None = None
+        expected_len: int | None = None
+        final = chunk_final == "1"
+
+        if chunk_offset is not None:
+            try:
+                offset = int(chunk_offset)
+                if offset < 0:
+                    offset = None
+            except ValueError:
+                offset = None
+
+        if chunk_total is not None:
+            try:
+                total = int(chunk_total)
+                if total < 0:
+                    total = None
+            except ValueError:
+                total = None
+
+        if chunk_len_hdr is not None:
+            try:
+                expected_len = int(chunk_len_hdr)
+                if expected_len < 0:
+                    expected_len = None
+            except ValueError:
+                expected_len = None
+
+        if offset is None:
+            mode = "wb"
+        else:
+            if offset == 0:
+                mode = "wb"
+            elif os.path.exists(file_path):
+                mode = "r+b"
+            else:
+                raise HTTPException(status_code=409, detail="Missing partial upload file")
+
+        content_length = request.headers.get("Content-Length")
+        client_host = getattr(getattr(request, "client", None), "host", None)
+        if offset is not None:
+            log_message(
+                f"[UPLOAD] Chunk offset={offset} total={total} final={final} len={content_length} enc={body_encoding or 'binary'} comp={body_compression or 'none'} from={client_host}"
+            )
+        else:
+            log_message(
+                f"[UPLOAD] Single-shot len={content_length} enc={body_encoding or 'binary'} comp={body_compression or 'none'} from={client_host}"
+            )
+
+        loop = asyncio.get_running_loop()
+        with open(file_path, mode) as buffer:
+            if offset is not None:
+                buffer.seek(offset)
+
+            if body_compression == "gzip" or body_encoding in {"base64", "hex"}:
+                raw_body = await request.body()
+                if body_encoding == "base64":
+                    decoded = base64.b64decode(raw_body, validate=False)
+                elif body_encoding == "hex":
+                    text = raw_body.decode("ascii", errors="ignore")
+                    hex_only = re.sub(r"[^0-9a-fA-F]", "", text)
+                    if len(hex_only) % 2 == 1:
+                        hex_only = hex_only[:-1]
+                    try:
+                        decoded = binascii.unhexlify(hex_only.encode("ascii"))
+                    except Exception:
+                        raise HTTPException(status_code=400, detail="Invalid hex body")
+                else:
+                    decoded = raw_body
+
                 if is_xor:
-                    # De-obfuscate (XOR 0x42)
-                    # We can use numpy or simple list comp, but for chunks standard bytes loop is fine or bytes.translate
-                    # Creating a translation table is fastest
-                    # 0x42 = 66
-                    chunk = bytes(b ^ 0x42 for b in chunk)
-                
-                # Run blocking write in executor to avoid blocking the event loop
-                await loop.run_in_executor(None, buffer.write, chunk)
-                
-                bytes_read += len(chunk)
-                # Print progress every ~5MB
-                if bytes_read % (5 * 1024 * 1024) < chunk_size:
-                    log_message(f"[UPLOAD] Processed {bytes_read / 1024 / 1024:.1f} MB...")
-                    
-        log_message(f"[UPLOAD] Successfully saved to: {file_path}")
-        return {"filename": filename, "status": "uploaded"}
+                    decoded = decoded.translate(_XOR_TABLE)
+
+                if body_compression == "gzip":
+                    try:
+                        decoded = gzip.decompress(decoded)
+                    except Exception:
+                        raise HTTPException(status_code=400, detail="Invalid gzip body")
+
+                await loop.run_in_executor(None, buffer.write, decoded)
+                bytes_written += len(decoded)
+            else:
+                write_buf = bytearray()
+                flush_threshold = 1024 * 1024
+                async for chunk in request.stream():
+                    if is_xor:
+                        chunk = chunk.translate(_XOR_TABLE)
+                    write_buf += chunk
+                    if len(write_buf) >= flush_threshold:
+                        buf_bytes = bytes(write_buf)
+                        await loop.run_in_executor(None, buffer.write, buf_bytes)
+                        bytes_written += len(buf_bytes)
+                        write_buf.clear()
+                if write_buf:
+                    buf_bytes = bytes(write_buf)
+                    await loop.run_in_executor(None, buffer.write, buf_bytes)
+                    bytes_written += len(buf_bytes)
+
+        if expected_len is not None and bytes_written != expected_len:
+            log_message(f"[UPLOAD] Length mismatch wrote={bytes_written} expected={expected_len}")
+            raise HTTPException(status_code=400, detail="Chunk length mismatch")
+
+        if total is not None and offset is not None:
+            done = min(offset + bytes_written, total)
+            log_message(f"[UPLOAD] Received {done}/{total} bytes ({(done / total) * 100:.1f}%)")
+
+        if offset is None or final:
+            log_message(f"[UPLOAD] Successfully saved to: {file_path}")
+            return {"filename": filename, "status": "uploaded"}
+
+        return {
+            "filename": filename,
+            "status": "partial",
+            "offset": offset,
+            "bytes_written": bytes_written,
+            "total": total,
+            "final": final,
+        }
+    except ClientDisconnect:
+        try:
+            existing = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        except Exception:
+            existing = 0
+        log_message(f"[UPLOAD] Error: ClientDisconnect (wrote={bytes_written} existing={existing})")
+        raise HTTPException(status_code=499, detail="Client disconnected")
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -533,6 +654,7 @@ async def start_process(req: StartRequest):
     
     # Force output buffering off to ensure real-time logs
     env["PYTHONUNBUFFERED"] = "1"
+    env["IDA_MCP_TRACE"] = "1"
     
     # Disable ONLY the MCP plugin auto-loading (via our custom flag in ida_mcp.py)
     # We MUST NOT set IDA_NO_PLUGINS=1 because loaders (like windmp) might rely on plugins (like windbg).

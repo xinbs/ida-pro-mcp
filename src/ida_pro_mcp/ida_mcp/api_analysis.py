@@ -103,7 +103,7 @@ def find_crypt_constants(
 ) -> dict:
     """Identify common cryptographic constants (AES S-Boxes, MD5/SHA initializers, etc.)"""
     import ida_search
-    import ida_idaapi
+    import ida_ida
     import struct
     
     results = {}
@@ -124,8 +124,13 @@ def find_crypt_constants(
                           0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76], # First 16 bytes
     }
     
-    min_ea = ida_idaapi.cvar.inf.min_ea
-    max_ea = ida_idaapi.cvar.inf.max_ea
+    try:
+        min_ea = ida_ida.inf_get_min_ea()
+        max_ea = ida_ida.inf_get_max_ea()
+    except Exception:
+        inf = idaapi.get_inf_structure()
+        min_ea = inf.min_ea
+        max_ea = inf.max_ea
     
     for name, pattern_ints in signatures.items():
         if found_count >= limit:
@@ -150,7 +155,7 @@ def find_crypt_constants(
         matches = []
         while True:
             ea = ida_search.find_binary(ea, max_ea, search_str, 16, ida_search.SEARCH_DOWN)
-            if ea == ida_idaapi.BADADDR:
+            if ea == idaapi.BADADDR:
                 break
                 
             matches.append(hex(ea))

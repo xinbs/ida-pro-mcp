@@ -1,4 +1,5 @@
 import re
+import os
 import sys
 import time
 import uuid
@@ -207,6 +208,40 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_mcp_post(self, body: bytes):
+        trace_enabled = os.environ.get("IDA_MCP_TRACE") == "1"
+        start_time = time.time()
+        req_summaries: list[str] = []
+        req_ids: list[object] = []
+
+        if trace_enabled and body:
+            try:
+                decoded = json.loads(body.decode("utf-8", errors="replace"))
+                requests = decoded if isinstance(decoded, list) else [decoded]
+                for r in requests:
+                    if not isinstance(r, dict):
+                        continue
+                    method = r.get("method")
+                    rid = r.get("id")
+                    req_ids.append(rid)
+                    summary = f"method={method} id={rid}"
+                    if method == "tools/call":
+                        params = r.get("params") or {}
+                        if isinstance(params, dict):
+                            tool_name = params.get("name")
+                            args = params.get("arguments")
+                            if isinstance(args, dict):
+                                arg_keys = list(args.keys())
+                                summary += f" tool={tool_name} arg_keys={arg_keys}"
+                            else:
+                                summary += f" tool={tool_name}"
+                    req_summaries.append(summary)
+            except Exception:
+                pass
+
+        if trace_enabled and req_summaries:
+            for s in req_summaries:
+                print(f"[MCP][REQ] {s}", flush=True)
+
         # Dispatch to MCP registry
         setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
         response = self.mcp_server.registry.dispatch(body)
@@ -224,6 +259,27 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             send_response(202, b"Accepted")
         else:
             send_response(200, json.dumps(response).encode("utf-8"))
+
+        if trace_enabled:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            try:
+                if isinstance(response, dict):
+                    rid = response.get("id")
+                    if "error" in response:
+                        err = response.get("error") or {}
+                        code = err.get("code")
+                        msg = err.get("message")
+                        if isinstance(msg, str) and len(msg) > 200:
+                            msg = msg[:200] + "..."
+                        print(f"[MCP][RESP] id={rid} error_code={code} ms={elapsed_ms} msg={msg}", flush=True)
+                    else:
+                        print(f"[MCP][RESP] id={rid} ok ms={elapsed_ms}", flush=True)
+                elif isinstance(response, list):
+                    print(f"[MCP][RESP] batch count={len(response)} ms={elapsed_ms}", flush=True)
+                else:
+                    print(f"[MCP][RESP] type={type(response).__name__} ms={elapsed_ms}", flush=True)
+            except Exception:
+                print(f"[MCP][RESP] ms={elapsed_ms}", flush=True)
 
 class McpServer:
     def __init__(self, name: str, version = "1.0.0"):

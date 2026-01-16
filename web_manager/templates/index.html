@@ -273,57 +273,158 @@
                     label.classList.add('opacity-75', 'cursor-wait');
 
                     try {
-                        // Use raw binary upload to avoid multipart/form-data buffering in system temp
-                        // which might trigger AV on malware samples.
-                        await new Promise((resolve, reject) => {
-                            const xhr = new XMLHttpRequest();
-                            xhr.open('POST', '/api/upload', true);
-                            
-                            // Pass filename in header
-                            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-                            
-                            // Enable XOR obfuscation to bypass AV network filters
-                            xhr.setRequestHeader('X-Obfuscation', 'xor');
-                            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-                            
-                            xhr.upload.onprogress = (e) => {
-                                if (e.lengthComputable) {
-                                    const percentComplete = Math.round((e.loaded / e.total) * 100);
-                                    const progressText = document.getElementById('upload-progress-text');
-                                    if (progressText) {
-                                        progressText.innerText = `Uploading ${percentComplete}%...`;
+                        let chunkSize = 2 * 1024 * 1024;
+                        const minChunkSize = 4 * 1024;
+                        const maxChunkSize = 8 * 1024 * 1024;
+                        let offset = 0;
+                        const total = file.size;
+                        const progressText = document.getElementById('upload-progress-text');
+                        const maxRetries = 3;
+                        let encoding = 'binary';
+                        let compression = 'none';
+
+                        const toBase64 = (u8) => {
+                            const chunk = 0x8000;
+                            const parts = [];
+                            for (let i = 0; i < u8.length; i += chunk) {
+                                parts.push(String.fromCharCode.apply(null, u8.subarray(i, i + chunk)));
+                            }
+                            return btoa(parts.join(''));
+                        };
+
+                        const toHex = (u8) => {
+                            let out = '';
+                            for (let i = 0; i < u8.length; i++) out += u8[i].toString(16).padStart(2, '0');
+                            return out;
+                        };
+
+                        const gzipBytes = async (u8) => {
+                            if (!('CompressionStream' in window)) {
+                                throw new Error('CompressionStream not supported');
+                            }
+                            const cs = new CompressionStream('gzip');
+                            const stream = new Blob([u8]).stream().pipeThrough(cs);
+                            const ab = await new Response(stream).arrayBuffer();
+                            return new Uint8Array(ab);
+                        };
+
+                        while (offset < total) {
+                            let uploaded = false;
+                            while (!uploaded) {
+                                const end = Math.min(offset + chunkSize, total);
+                                const buf = await file.slice(offset, end).arrayBuffer();
+                                const original = new Uint8Array(buf);
+                                let payload = original;
+
+                                if (compression === 'gzip') {
+                                    payload = await gzipBytes(payload);
+                                }
+
+                                for (let i = 0; i < payload.length; i++) payload[i] ^= 0x42;
+
+                                const body = encoding === 'base64' ? toBase64(payload) : (encoding === 'hex' ? toHex(payload) : payload);
+                                let attempt = 0;
+                                while (true) {
+                                    try {
+                                        const headers = {
+                                            'X-Filename': encodeURIComponent(file.name),
+                                            'X-Obfuscation': 'xor',
+                                            'X-Chunk-Offset': String(offset),
+                                            'X-Chunk-Total': String(total),
+                                            'X-Chunk-Final': end >= total ? '1' : '0',
+                                            'X-Chunk-Len': String(end - offset),
+                                            'Content-Type': 'application/octet-stream',
+                                        };
+                                        if (encoding === 'base64' || encoding === 'hex') {
+                                            headers['X-Content-Encoding'] = encoding;
+                                            headers['Content-Type'] = 'text/plain; charset=UTF-8';
+                                        }
+                                        if (compression === 'gzip') {
+                                            headers['X-Chunk-Compression'] = 'gzip';
+                                        }
+                                        const res = await fetch('/api/upload', {
+                                            method: 'POST',
+                                            headers,
+                                            body,
+                                            cache: 'no-store',
+                                        });
+
+                                        if (res.ok) {
+                                            uploaded = true;
+                                            offset = end;
+                                            if (encoding === 'binary' && compression === 'none' && chunkSize < maxChunkSize) {
+                                                chunkSize = Math.min(maxChunkSize, chunkSize * 2);
+                                            }
+                                            break;
+                                        }
+
+                                        let text = '';
+                                        try { text = await res.text(); } catch (e) {}
+                                        const msg = text || res.statusText || `HTTP ${res.status}`;
+                                        const e = new Error(msg);
+                                        e.status = res.status;
+                                        throw e;
+                                    } catch (err) {
+                                        attempt += 1;
+                                        const status = (err && typeof err === 'object' && 'status' in err) ? err.status : null;
+                                        const isProxyLike = status === 499 || status === 413 || status === 502 || status === 503 || status === 504;
+                                        if ((encoding === 'binary' && compression === 'none' && (attempt >= 1 || isProxyLike)) ||
+                                            (encoding === 'hex' && compression === 'none' && attempt >= 1)) {
+                                            const percentComplete = Math.round((offset / total) * 100);
+                                            if ('CompressionStream' in window) {
+                                                compression = 'gzip';
+                                                encoding = 'base64';
+                                                chunkSize = Math.max(chunkSize, 256 * 1024);
+                                                if (progressText) progressText.innerText = `Uploading ${percentComplete}%... (gzip+base64)`;
+                                            } else {
+                                                encoding = 'base64';
+                                                chunkSize = Math.max(chunkSize, 256 * 1024);
+                                                if (progressText) progressText.innerText = `Uploading ${percentComplete}%... (base64)`;
+                                            }
+                                            break;
+                                        }
+
+                                        if (attempt >= maxRetries) {
+                                            if (chunkSize > minChunkSize) {
+                                                chunkSize = Math.max(minChunkSize, Math.floor(chunkSize / 2));
+                                                if (progressText) {
+                                                    const percentComplete = Math.round((offset / total) * 100);
+                                                    progressText.innerText = `Uploading ${percentComplete}%... (chunk=${Math.round(chunkSize / 1024)}KB)`;
+                                                }
+                                                break;
+                                            }
+                                            if (encoding === 'base64') {
+                                                encoding = 'hex';
+                                                if (progressText) {
+                                                    const percentComplete = Math.round((offset / total) * 100);
+                                                    const mode = compression === 'gzip' ? 'gzip+hex' : 'hex';
+                                                    progressText.innerText = `Uploading ${percentComplete}%... (${mode})`;
+                                                }
+                                                break;
+                                            }
+                                            if (encoding === 'hex' && compression === 'none' && 'CompressionStream' in window) {
+                                                compression = 'gzip';
+                                                encoding = 'base64';
+                                                if (progressText) {
+                                                    const percentComplete = Math.round((offset / total) * 100);
+                                                    progressText.innerText = `Uploading ${percentComplete}%... (gzip+base64)`;
+                                                }
+                                                break;
+                                            }
+                                            throw err;
+                                        }
+
+                                        const delay = Math.min(400, 80 * attempt);
+                                        await new Promise(r => setTimeout(r, delay));
                                     }
                                 }
-                            };
-                            
-                            xhr.onload = async () => {
-                                if (xhr.status === 200) {
-                                    resolve(JSON.parse(xhr.responseText));
-                                } else {
-                                    reject(new Error(xhr.responseText || xhr.statusText));
-                                }
-                            };
-                            
-                            xhr.onerror = () => {
-                                reject(new Error("Network Error"));
-                            };
-                            
-                            // Read file and XOR it
-                            const reader = new FileReader();
-                            reader.onload = function(e) {
-                                const buffer = e.target.result;
-                                const view = new Uint8Array(buffer);
-                                // XOR with 0x42
-                                for (let i = 0; i < view.length; i++) {
-                                    view[i] ^= 0x42;
-                                }
-                                xhr.send(view);
-                            };
-                            reader.onerror = function(e) {
-                                reject(new Error("File Read Error: " + e.target.error));
-                            };
-                            reader.readAsArrayBuffer(file);
-                        });
+                            }
+
+                            if (progressText) {
+                                const percentComplete = Math.round((offset / total) * 100);
+                                progressText.innerText = `Uploading ${percentComplete}%...`;
+                            }
+                        }
 
                         await this.loadFiles();
                         event.target.value = ''; // Reset input
